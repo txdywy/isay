@@ -11,26 +11,27 @@
   let localAnalyser = null;
   let vizRAF = null;
   let statsInterval = null;
-  let prevStats = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let currentToken = null;
   let currentRole = null;              // "host" or "guest"
-  let iceRestarted = false;
   let wakeLock = null;
   let lastQualityScore = -1;
-  let bitrateAppliedOnce = false;
   let currentAudioOutput = "default";
   let speakerOn = true;
-  let lastIceRestart = 0;
+  let networkMigrationInitialized = false;
 
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
+  const pendingCalls = new Map(); // peerId -> { call, timer, attempts }
+  const qosByConnection = new WeakMap();
   const MAX_PEERS = 8;
 
   const MAX_RECONNECT_ATTEMPTS = 3;
-  const ICE_RECONNECT_WAIT = 4000;
   const RECONNECT_BACKOFF = [2000, 4000, 8000];
+  const CALL_STREAM_TIMEOUT = 12000;
+  const HOST_RETRY_DELAYS = [0, 2500, 6500];
+  const MESH_CONNECT_DELAY = 900;
 
   // ========== Word list ==========
   const ADJECTIVES = [
@@ -139,7 +140,7 @@
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 4,
+    iceCandidatePoolSize: 1,
   };
 
   // --- DOM ---
@@ -235,7 +236,8 @@
 
   // --- Adaptive bitrate ---
   async function adaptAudioBitrate(pc, loss, jitter, rtt) {
-    if (!bitrateAppliedOnce) { bitrateAppliedOnce = true; return; }
+    const qos = getQoSState(pc);
+    if (!qos.bitrateAppliedOnce) { qos.bitrateAppliedOnce = true; return; }
     const sender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
     if (!sender) return;
     try {
@@ -261,6 +263,7 @@
 
   // --- Jitter buffer (aggressive low-latency for WiFi) ---
   function configureJitterBuffer(pc, jitter) {
+    if (jitter < 0) return;
     try {
       pc.getReceivers().forEach((receiver) => {
         if (receiver.track.kind === "audio" && "jitterBufferTarget" in receiver) {
@@ -274,15 +277,18 @@
   }
 
   // --- Network migration ---
-  function setupNetworkMigration(pc) {
-    if (!navigator.connection) return;
+  function setupNetworkMigration() {
+    if (!navigator.connection || networkMigrationInitialized) return;
+    networkMigrationInitialized = true;
     let lastType = navigator.connection.effectiveType;
     navigator.connection.addEventListener("change", () => {
       const newType = navigator.connection.effectiveType;
       if (newType !== lastType) {
         lastType = newType;
         showToast(`Network: ${newType}. Adjusting...`);
-        try { pc.restartIce(); } catch (_) {}
+        for (const [, info] of peers) {
+          attemptICERestart(info.call?.peerConnection);
+        }
       }
     });
   }
@@ -354,6 +360,13 @@
 
   // ========== Mesh peer management ==========
   function addPeer(peerId, call, stream) {
+    clearPendingCall(peerId, false);
+
+    if (peers.has(peerId)) {
+      try { call.close(); } catch (_) {}
+      return;
+    }
+
     if (peers.size >= MAX_PEERS) {
       call.close();
       showToast("Room is full (max 8 people).");
@@ -384,7 +397,7 @@
 
     peers.set(peerId, { call, remoteAudio, analyser });
 
-    call.on("close", () => removePeer(peerId));
+    call.on("close", () => removePeer(peerId, false));
     call.on("error", () => removePeer(peerId));
 
     monitorSinglePeerConnection(call.peerConnection);
@@ -399,15 +412,17 @@
     }
   }
 
-  function removePeer(peerId) {
+  function removePeer(peerId, closeCall = true) {
     const info = peers.get(peerId);
     if (!info) return;
-    info.call.close();
+    peers.delete(peerId);
+    if (closeCall) {
+      try { info.call.close(); } catch (_) {}
+    }
     if (info.remoteAudio) {
       info.remoteAudio.pause();
       info.remoteAudio.srcObject = null;
     }
-    peers.delete(peerId);
     updatePeerCount();
     if (peers.size === 0 && currentToken) {
       endCall("All peers disconnected.");
@@ -415,8 +430,9 @@
   }
 
   function closeAllPeers() {
+    clearAllPendingCalls();
     for (const [id, info] of peers) {
-      info.call.close();
+      try { info.call.close(); } catch (_) {}
       if (info.remoteAudio) {
         info.remoteAudio.pause();
         info.remoteAudio.srcObject = null;
@@ -425,24 +441,52 @@
     peers.clear();
   }
 
+  function clearPendingCall(peerId, closeCall = true) {
+    const pending = pendingCalls.get(peerId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    if (closeCall && pending.call) {
+      try { pending.call.close(); } catch (_) {}
+    }
+    pendingCalls.delete(peerId);
+  }
+
+  function clearAllPendingCalls() {
+    for (const peerId of pendingCalls.keys()) {
+      clearPendingCall(peerId);
+    }
+  }
+
   // ========== Connection monitoring (per-peer) ==========
   function monitorSinglePeerConnection(pc) {
     if (!pc) return;
-    setupNetworkMigration(pc);
+    setupNetworkMigration();
+
+    pc.onconnectionstatechange = () => {
+      console.debug("[iSay] peer connectionState:", pc.connectionState);
+      if (pc.connectionState === "failed") scheduleReconnect();
+    };
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
+      console.debug("[iSay] peer iceConnectionState:", state);
       if (state === "connected" || state === "completed") {
         reconnectAttempts = 0;
-        bitrateAppliedOnce = false;
-        startStatsMonitor(pc);
+        getQoSState(pc).bitrateAppliedOnce = false;
+        startStatsMonitor();
+      } else if (state === "failed") {
+        scheduleReconnect();
       }
     };
+
+    pc.onicegatheringstatechange = () => console.debug("[iSay] peer iceGatheringState:", pc.iceGatheringState);
+    pc.onsignalingstatechange = () => console.debug("[iSay] peer signalingState:", pc.signalingState);
   }
 
   // ========== Duration ==========
   function startDurationTimer() {
-    callStartTime = Date.now();
+    if (durationTimer) return;
+    if (!callStartTime) callStartTime = Date.now();
     durationTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - callStartTime) / 1000);
       const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
@@ -454,6 +498,7 @@
   function stopDurationTimer() {
     clearInterval(durationTimer);
     durationTimer = null;
+    callStartTime = null;
   }
 
   // ========== Phase indicator ==========
@@ -676,6 +721,15 @@
   }
 
   // ========== Connection quality monitoring ==========
+  function getQoSState(pc) {
+    let state = qosByConnection.get(pc);
+    if (!state) {
+      state = { prevStats: {}, consecBad: 0, bitrateAppliedOnce: false, lastIceRestart: 0 };
+      qosByConnection.set(pc, state);
+    }
+    return state;
+  }
+
   function setConnType(type) {
     const badge = $("#conn-type-badge");
     const icon = $("#conn-icon");
@@ -725,85 +779,128 @@
   }
 
   let statsPaused = false;
+  let statsInFlight = false;
   let glitchStats = { lastTs: 0 };
-  function startStatsMonitor(pc) {
-    prevStats = null;
-    let consecBad = 0;
+  function startStatsMonitor() {
     if (statsInterval) return; // Already running
-    statsInterval = setInterval(() => {
+    statsInterval = setInterval(async () => {
       if (statsPaused) return;
-      if (!pc || pc.connectionState === "closed") { stopStatsMonitor(); return; }
-      pc.getStats().then((stats) => {
-        let isRelay = false;
-        let currentPair = null;
-        stats.forEach((report) => {
-          if (report.type === "candidate-pair" && report.state === "succeeded") currentPair = report;
-          if (report.type === "local-candidate" && report.candidateType === "relay") isRelay = true;
-        });
-        if (currentPair) {
-          const latency = currentPair.currentRoundTripTime ? currentPair.currentRoundTripTime * 1000 : -1;
-          let loss = -1, jitter = -1;
-          let recvBitrate = -1;
-          stats.forEach((report) => {
-            if (report.type === "inbound-rtp" && report.kind === "audio") {
-              if (prevStats && prevStats[report.id]) {
-                const prev = prevStats[report.id];
-                const dRecv = report.packetsReceived - prev.packetsReceived;
-                const dLost = (report.packetsLost || 0) - (prev.packetsLost || 0);
-                const total = dRecv + dLost;
-                if (total > 0) loss = (dLost / total) * 100;
-                // Bitrate estimation
-                const dBytes = (report.bytesReceived || 0) - (prev.bytesReceived || 0);
-                recvBitrate = Math.round((dBytes * 8) / 2); // kbps over 2s interval
-                // Glitch detection: concealed samples indicate packet loss concealment
-                const dConcealed = (report.concealedSamples || 0) - (prev.concealedSamples || 0);
-                const dTotalSamples = (report.totalSamplesReceived || 0) - (prev.totalSamplesReceived || 0);
-                if (dTotalSamples > 0 && dConcealed > 0) {
-                  const glitchRate = dConcealed / dTotalSamples;
-                  if (glitchRate > 0.03) {
-                    const now = Date.now();
-                    if (now - glitchStats.lastTs > 8000) {
-                      glitchStats.lastTs = now;
-                      showToast(`Audio stutter: ${(glitchRate * 100).toFixed(0)}% concealed`, 2500);
-                    }
-                  }
-                }
-              } else {
-                const total = report.packetsReceived + (report.packetsLost || 0);
-                if (total > 0) loss = ((report.packetsLost || 0) / total) * 100;
-              }
-              if (report.jitter !== undefined) jitter = report.jitter * 1000;
-              if (!prevStats) prevStats = {};
-              prevStats[report.id] = {
-                packetsReceived: report.packetsReceived,
-                packetsLost: report.packetsLost || 0,
-                bytesReceived: report.bytesReceived || 0,
-                concealedSamples: report.concealedSamples || 0,
-                totalSamplesReceived: report.totalSamplesReceived || 0,
-              };
-            }
-          });
-          updateMetrics(latency, jitter, loss);
-          setConnType(isRelay ? "relay" : "p2p");
-          const rtt = currentPair.currentRoundTripTime || 0;
-          adaptAudioBitrate(pc, loss, jitter, rtt);
+      if (statsInFlight) return;
+      statsInFlight = true;
+      try {
+        const connectedPeers = [...peers.values()]
+          .map((info) => info.call?.peerConnection)
+          .filter((pc) => pc && pc.connectionState !== "closed");
+
+        if (!connectedPeers.length) { stopStatsMonitor(); return; }
+
+        const snapshots = await Promise.all(connectedPeers.map((pc) => collectConnectionStats(pc)));
+        const validSnapshots = snapshots.filter(Boolean);
+        if (!validSnapshots.length) return;
+
+        const worstLatency = Math.max(...validSnapshots.map((s) => s.latency).filter((v) => v >= 0), -1);
+        const worstJitter = Math.max(...validSnapshots.map((s) => s.jitter).filter((v) => v >= 0), -1);
+        const worstLoss = Math.max(...validSnapshots.map((s) => s.loss).filter((v) => v >= 0), -1);
+        updateMetrics(worstLatency, worstJitter, worstLoss);
+        setConnType(validSnapshots.some((s) => s.isRelay) ? "relay" : "p2p");
+
+        for (const snapshot of validSnapshots) {
+          const { pc, latency, jitter, loss, rtt } = snapshot;
+          const safeLoss = loss >= 0 ? loss : 0;
+          const safeJitter = jitter >= 0 ? jitter : 0;
+          adaptAudioBitrate(pc, safeLoss, safeJitter, rtt);
           configureJitterBuffer(pc, jitter);
-          // Preemptive ICE restart: act on trend, not just threshold
-          if (loss > 12 || latency > 400) {
-            consecBad++;
-            if (consecBad >= 2) { attemptICERestart(pc); consecBad = 0; }
-          } else if (loss < 5 && latency < 200) {
-            consecBad = Math.max(0, consecBad - 1);
+
+          const qos = getQoSState(pc);
+          if (safeLoss > 12 || latency > 400) {
+            qos.consecBad++;
+            if (qos.consecBad >= 2) { attemptICERestart(pc); qos.consecBad = 0; }
+          } else if (safeLoss < 5 && latency >= 0 && latency < 200) {
+            qos.consecBad = Math.max(0, qos.consecBad - 1);
           }
         }
-      }).catch(() => {});
+      } finally {
+        statsInFlight = false;
+      }
     }, 2000);
+  }
+
+  async function collectConnectionStats(pc) {
+    try {
+      const stats = await pc.getStats();
+      const reports = new Map();
+      stats.forEach((report) => reports.set(report.id, report));
+
+      let currentPair = null;
+      stats.forEach((report) => {
+        if (report.type !== "candidate-pair" || report.state !== "succeeded") return;
+        if (report.selected || report.nominated) currentPair = report;
+        else if (!currentPair && report.currentRoundTripTime !== undefined) currentPair = report;
+      });
+      if (!currentPair) return null;
+
+      const localCandidate = reports.get(currentPair.localCandidateId);
+      const remoteCandidate = reports.get(currentPair.remoteCandidateId);
+      const isRelay = localCandidate?.candidateType === "relay" || remoteCandidate?.candidateType === "relay";
+      const rtt = currentPair.currentRoundTripTime || 0;
+      const latency = rtt ? rtt * 1000 : -1;
+      const qos = getQoSState(pc);
+
+      let recvDelta = 0;
+      let lostDelta = 0;
+      let totalPackets = 0;
+      let lostPackets = 0;
+      let jitter = -1;
+
+      stats.forEach((report) => {
+        if (report.type !== "inbound-rtp" || report.kind !== "audio") return;
+
+        const prev = qos.prevStats[report.id];
+        if (prev) {
+          const dRecv = Math.max(0, report.packetsReceived - prev.packetsReceived);
+          const dLost = Math.max(0, (report.packetsLost || 0) - prev.packetsLost);
+          recvDelta += dRecv;
+          lostDelta += dLost;
+
+          const dConcealed = Math.max(0, (report.concealedSamples || 0) - prev.concealedSamples);
+          const dTotalSamples = Math.max(0, (report.totalSamplesReceived || 0) - prev.totalSamplesReceived);
+          if (dTotalSamples > 0 && dConcealed > 0) {
+            const glitchRate = dConcealed / dTotalSamples;
+            if (glitchRate > 0.03) {
+              const now = Date.now();
+              if (now - glitchStats.lastTs > 8000) {
+                glitchStats.lastTs = now;
+                showToast(`Audio stutter: ${(glitchRate * 100).toFixed(0)}% concealed`, 2500);
+              }
+            }
+          }
+        }
+
+        totalPackets += report.packetsReceived + (report.packetsLost || 0);
+        lostPackets += report.packetsLost || 0;
+        if (report.jitter !== undefined) jitter = Math.max(jitter, report.jitter * 1000);
+        qos.prevStats[report.id] = {
+          packetsReceived: report.packetsReceived,
+          packetsLost: report.packetsLost || 0,
+          concealedSamples: report.concealedSamples || 0,
+          totalSamplesReceived: report.totalSamplesReceived || 0,
+        };
+      });
+
+      let loss = -1;
+      if (recvDelta + lostDelta > 0) loss = (lostDelta / (recvDelta + lostDelta)) * 100;
+      else if (totalPackets > 0) loss = (lostPackets / totalPackets) * 100;
+
+      return { pc, latency, jitter, loss, rtt, isRelay };
+    } catch (_) {
+      return null;
+    }
   }
 
   function stopStatsMonitor() {
     clearInterval(statsInterval);
     statsInterval = null;
-    prevStats = null;
+    statsInFlight = false;
     lastQualityScore = -1;
   }
 
@@ -812,12 +909,14 @@
     const target = pc || (peers.values().next().value?.call?.peerConnection);
     if (!target) return;
     const now = Date.now();
-    if (now - lastIceRestart < 10000) return;
-    lastIceRestart = now;
+    const qos = getQoSState(target);
+    if (now - qos.lastIceRestart < 10000) return;
+    qos.lastIceRestart = now;
     try { target.restartIce(); } catch (_) {}
   }
 
   function scheduleReconnect() {
+    if (reconnectTimer) return;
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       endCall("Connection lost. Max reconnection attempts reached.");
       return;
@@ -828,7 +927,6 @@
     setQuality(0, "Reconnecting...");
     announce("Connection lost. Reconnecting.");
 
-    clearReconnectTimer();
     reconnectTimer = setTimeout(async () => {
       reconnectAttempts++;
       if (!currentToken) { endCall("Connection lost."); return; }
@@ -853,33 +951,104 @@
 
   // ========== Mesh connection handling ==========
   function handleIncomingCall(call) {
+    if (peers.has(call.peer)) {
+      try { call.close(); } catch (_) {}
+      return;
+    }
     applySDPOptimization(call);
+    monitorSinglePeerConnection(call.peerConnection);
     call.on("stream", (remoteStream) => {
       addPeer(call.peer, call, remoteStream);
     });
-    call.answer(localStream);
+    call.on("close", () => removePeer(call.peer, false));
+    call.on("error", (err) => {
+      console.warn("[iSay] incoming call error:", call.peer, err);
+      removePeer(call.peer);
+    });
+    try {
+      call.answer(localStream);
+    } catch (err) {
+      console.warn("[iSay] answer failed:", call.peer, err);
+      try { call.close(); } catch (_) {}
+    }
   }
 
-  function initiateCall(targetPeerId) {
-    if (peers.has(targetPeerId)) return; // Already connected
+  function initiateCall(targetPeerId, options = {}) {
+    if (!peer || !peer.open || targetPeerId === peer.id) return;
+    if (peers.has(targetPeerId) || pendingCalls.has(targetPeerId)) return;
+
+    const attempt = options.attempt || 1;
+    const maxAttempts = options.maxAttempts || 1;
     const call = peer.call(targetPeerId, localStream);
-    if (!call) return;
+    if (!call) {
+      retryCall(targetPeerId, options);
+      return;
+    }
+
+    console.debug("[iSay] dialing peer:", targetPeerId, "attempt:", attempt);
     applySDPOptimization(call);
+    monitorSinglePeerConnection(call.peerConnection);
+
+    const timer = setTimeout(() => {
+      if (peers.has(targetPeerId)) return;
+      console.warn("[iSay] call stream timeout:", targetPeerId, "attempt:", attempt);
+      clearPendingCall(targetPeerId);
+      if (attempt < maxAttempts) {
+        const retryDelays = options.retryDelays || [];
+        const retryDelay = retryDelays[attempt] ?? 1500;
+        setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
+      } else if (options.required && peers.size === 0 && currentToken) {
+        endCall("No answer. Ask the other person to keep the call page open, then reconnect.");
+      }
+    }, CALL_STREAM_TIMEOUT);
+
+    pendingCalls.set(targetPeerId, { call, timer, attempts: attempt });
+
     call.on("stream", (remoteStream) => {
       addPeer(targetPeerId, call, remoteStream);
     });
-    call.on("close", () => removePeer(targetPeerId));
-    call.on("error", () => removePeer(targetPeerId));
+    call.on("close", () => {
+      clearPendingCall(targetPeerId, false);
+      removePeer(targetPeerId, false);
+    });
+    call.on("error", (err) => {
+      console.warn("[iSay] outgoing call error:", targetPeerId, err);
+      clearPendingCall(targetPeerId, false);
+      removePeer(targetPeerId);
+      if (!peers.has(targetPeerId) && attempt < maxAttempts) {
+        retryCall(targetPeerId, options);
+      } else if (options.required && peers.size === 0 && currentToken) {
+        endCall("No answer. Ask the other person to keep the call page open, then reconnect.");
+      }
+    });
+  }
+
+  function retryCall(targetPeerId, options) {
+    const attempt = options.attempt || 1;
+    const maxAttempts = options.maxAttempts || 1;
+    if (attempt >= maxAttempts) return;
+    const retryDelays = options.retryDelays || [];
+    const retryDelay = retryDelays[attempt] ?? 1500;
+    setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
   }
 
   // ========== PeerJS connection ==========
-  function getRoomPeerIds(token) {
-    // Generate all possible peer IDs for this room
-    const ids = [`isay-${token}-host`];
-    for (let i = 0; i < MAX_PEERS; i++) {
-      ids.push(`isay-${token}-g${i}`);
-    }
-    return ids;
+  function attachPeerLifecycleHandlers(p) {
+    p.on("disconnected", () => {
+      console.warn("[iSay] PeerJS signaling disconnected");
+      if (peer !== p || p.destroyed) return;
+      setPhase("signaling");
+      setTimeout(() => {
+        if (peer === p && !p.destroyed && p.disconnected) {
+          try { p.reconnect(); } catch (_) {}
+        }
+      }, 500);
+    });
+
+    p.on("close", () => {
+      console.warn("[iSay] PeerJS connection closed");
+      if (peer === p) clearAllPendingCalls();
+    });
   }
 
   async function connectPeer(token) {
@@ -906,6 +1075,7 @@
       }, 12000);
 
       const p = new Peer(hostId, { debug: 0, config: ICE_CONFIG });
+      attachPeerLifecycleHandlers(p);
 
       p.on("open", () => {
         currentRole = "host";
@@ -932,6 +1102,7 @@
             }
             const guestId = `isay-${token}-g${guestIdx}`;
             const gp = new Peer(guestId, { debug: 0, config: ICE_CONFIG });
+            attachPeerLifecycleHandlers(gp);
 
             gp.on("open", () => {
               currentRole = "guest";
@@ -944,15 +1115,13 @@
               // Initiate audio viz for local stream
               initAudioViz();
 
-              // Connect to all existing peers in room
-              const allIds = getRoomPeerIds(token);
-              for (const id of allIds) {
-                if (id !== guestId) {
-                  // Try connecting with a stagger to avoid overwhelming
-                  setTimeout(() => {
-                    if (peer && peer.open) initiateCall(id);
-                  }, guestIdx * 200);
-                }
+              // Connect to host first. Other occupied guest slots are secondary mesh links.
+              initiateCall(hostId, { maxAttempts: HOST_RETRY_DELAYS.length, retryDelays: HOST_RETRY_DELAYS, required: true });
+              for (let i = 0; i < guestIdx; i++) {
+                const id = `isay-${token}-g${i}`;
+                setTimeout(() => {
+                  if (peer && peer.open) initiateCall(id, { maxAttempts: 1 });
+                }, MESH_CONNECT_DELAY + i * 250);
               }
 
               resolve({ role: "guest" });
@@ -1061,14 +1230,12 @@
   }
 
   function endCall(reason) {
-    clearCallTimeout();
     clearReconnectTimer();
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
     releaseWakeLock();
     reconnectAttempts = 0;
-    bitrateAppliedOnce = false;
     closeAllPeers();
     stopLocalStream();
     destroyPeer();
@@ -1087,11 +1254,13 @@
     showScreen("disconnected");
   }
 
-  function destroyPeer() { if (peer) { peer.destroy(); peer = null; } }
-
-  let callTimeoutId = null;
-  function setCallTimeout() { clearCallTimeout(); callTimeoutId = setTimeout(() => endCall("No answer."), 20000); }
-  function clearCallTimeout() { if (callTimeoutId) { clearTimeout(callTimeoutId); callTimeoutId = null; } }
+  function destroyPeer() {
+    clearAllPendingCalls();
+    if (peer) {
+      try { peer.destroy(); } catch (_) {}
+      peer = null;
+    }
+  }
 
   function restart() {
     closeAllPeers();
@@ -1101,7 +1270,6 @@
     clearReconnectTimer();
     releaseWakeLock();
     reconnectAttempts = 0;
-    bitrateAppliedOnce = false;
     currentToken = null;
     currentRole = null;
     isMuted = false;
