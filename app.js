@@ -314,53 +314,36 @@
   }
 
   // ========== QR Code ==========
-  function generateQR(text, canvas, size) {
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext("2d");
-
+  function generateQR(text, imgEl, size) {
     if (!generateQR._loaded) {
       const script = document.createElement("script");
       script.src = "https://cdn.jsdelivr.net/npm/qrcode@latest/build/qrcode.min.js";
       script.onload = () => {
         generateQR._loaded = true;
-        generateQR(text, canvas, size);
+        generateQR(text, imgEl, size);
       };
       script.onerror = () => {
-        ctx.fillStyle = "#1a1a1a";
-        ctx.fillRect(0, 0, size, size);
-        ctx.fillStyle = "#888";
-        ctx.font = "12px sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText("QR unavailable", size / 2, size / 2);
+        imgEl.style.display = "none";
       };
       document.head.appendChild(script);
       return;
     }
 
     try {
-      QRCode.toCanvas(canvas, text, {
+      QRCode.toDataURL(text, {
         width: size,
         margin: 2,
-        color: { dark: "4f9cf7", light: "1a1a1a" },
+        color: { dark: "#4f9cf7", light: "#1a1a1a" },
         errorCorrectionLevel: "M",
-      }, (err) => {
-        if (err) {
-          ctx.fillStyle = "#1a1a1a";
-          ctx.fillRect(0, 0, size, size);
-          ctx.fillStyle = "#888";
-          ctx.font = "12px sans-serif";
-          ctx.textAlign = "center";
-          ctx.fillText("QR error", size / 2, size / 2);
+      }, (err, url) => {
+        if (!err && url) {
+          imgEl.src = url;
+        } else {
+          imgEl.style.display = "none";
         }
       });
     } catch (_) {
-      ctx.fillStyle = "#1a1a1a";
-      ctx.fillRect(0, 0, size, size);
-      ctx.fillStyle = "#888";
-      ctx.font = "12px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("QR error", size / 2, size / 2);
+      imgEl.style.display = "none";
     }
   }
 
@@ -788,9 +771,8 @@
   function showShareLink(token) {
     const link = buildShareLink(token);
     $("#share-link").value = link;
-    // Generate QR code
-    const qrCanvas = $("#qr-canvas");
-    if (qrCanvas) generateQR(link, qrCanvas, 160);
+    const qrImg = $("#qr-img");
+    if (qrImg) generateQR(link, qrImg, 160);
   }
 
   function copyShareLink() {
@@ -825,9 +807,9 @@
     token = token.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
     if (!token) { $("#token-input").focus(); return; }
 
-    showShareLink(token);
     setPhase("signaling");
     showScreen("waiting");
+    showShareLink(token);
 
     try {
       const result = await connectPeer(token);

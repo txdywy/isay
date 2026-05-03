@@ -508,9 +508,10 @@ button:active {
   margin-bottom: 16px;
 }
 
-.qr-section canvas {
+.qr-section img {
   border-radius: var(--radius);
   border: 1px solid var(--border);
+  image-rendering: pixelated;
 }
 
 /* ========== Speaking indicator ========== */
@@ -609,5 +610,5 @@ button:focus-visible {
   .btn-control { min-width: 80px; padding: 14px 16px; }
   .conn-bar { flex-direction: column; align-items: stretch; text-align: center; }
   .conn-metrics { justify-content: center; }
-  .qr-section canvas { width: 120px; height: 120px; }
+  .qr-section img { width: 120px; height: 120px; }
 }
