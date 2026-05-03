@@ -8,7 +8,7 @@
 </head>
 <body>
   <div id="app">
-    <!-- Landing: enter token to pair -->
+    <!-- Landing -->
     <section id="screen-landing" class="screen active">
       <div class="container">
         <h1>iSay</h1>
@@ -21,11 +21,27 @@
       </div>
     </section>
 
-    <!-- Waiting for peer -->
+    <!-- Waiting / Connecting phases -->
     <section id="screen-waiting" class="screen">
       <div class="container">
-        <div class="spinner"></div>
-        <h2>Waiting for peer...</h2>
+        <!-- Phase indicator -->
+        <div class="phase-indicator" id="phase-indicator">
+          <div class="phase-step" data-phase="signaling">
+            <div class="phase-dot"></div>
+            <span>Signaling</span>
+          </div>
+          <div class="phase-line"></div>
+          <div class="phase-step" data-phase="ice">
+            <div class="phase-dot"></div>
+            <span>ICE</span>
+          </div>
+          <div class="phase-line"></div>
+          <div class="phase-step" data-phase="connected">
+            <div class="phase-dot"></div>
+            <span>Connected</span>
+          </div>
+        </div>
+        <p class="subtitle" id="phase-label">Initializing...</p>
         <p class="subtitle">Share this link to invite someone:</p>
         <div class="share-link-box">
           <input type="text" id="share-link" readonly>
@@ -44,13 +60,51 @@
     <!-- Active call -->
     <section id="screen-call" class="screen">
       <div class="container">
-        <div class="call-status">
-          <div class="pulse-ring"></div>
-          <div class="call-icon">🎙</div>
+        <!-- Audio visualizer -->
+        <div class="visualizer-wrap">
+          <canvas id="visualizer" width="320" height="120"></canvas>
+          <div class="visualizer-labels">
+            <span id="label-local">You</span>
+            <span id="label-remote">Peer</span>
+          </div>
         </div>
+
+        <!-- Connection info bar -->
+        <div class="conn-bar" id="conn-bar">
+          <div class="conn-badge" id="conn-type-badge">
+            <span class="conn-icon" id="conn-icon">?</span>
+            <span id="conn-type-text">Connecting</span>
+          </div>
+          <div class="conn-metrics">
+            <div class="metric">
+              <span class="metric-value" id="metric-latency">--</span>
+              <span class="metric-label">ms</span>
+            </div>
+            <div class="metric-divider"></div>
+            <div class="metric">
+              <span class="metric-value" id="metric-jitter">--</span>
+              <span class="metric-label">jitter</span>
+            </div>
+            <div class="metric-divider"></div>
+            <div class="metric">
+              <span class="metric-value" id="metric-loss">--</span>
+              <span class="metric-label">loss</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quality bar -->
+        <div class="quality-bar">
+          <div class="quality-segments" id="quality-segments">
+            <div class="seg"></div><div class="seg"></div><div class="seg"></div><div class="seg"></div><div class="seg"></div>
+          </div>
+          <span class="quality-label" id="quality-label">--</span>
+        </div>
+
         <h2 id="call-status-text">Connected</h2>
         <p class="subtitle" id="call-duration">00:00</p>
-        <p id="call-conn-status" class="conn-status"></p>
+
+        <!-- Controls -->
         <div class="controls">
           <button id="btn-mute" class="btn-control" title="Mute">
             <svg id="icon-mic-on" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
