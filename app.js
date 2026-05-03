@@ -2,31 +2,34 @@
   "use strict";
 
   // ========== State ==========
-  let peer = null;
-  let currentCall = null;
+  let peer = null;                     // Our PeerJS instance
   let localStream = null;
   let isMuted = false;
   let callStartTime = null;
   let durationTimer = null;
   let audioCtx = null;
   let localAnalyser = null;
-  let remoteAnalyser = null;
   let vizRAF = null;
   let statsInterval = null;
   let prevStats = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let currentToken = null;
-  let currentRole = null;
+  let currentRole = null;              // "host" or "guest"
   let iceRestarted = false;
   let wakeLock = null;
   let lastQualityScore = -1;
+  let bitrateAppliedOnce = false;
+
+  // Mesh: track all active peer connections
+  const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
+  const MAX_PEERS = 8;
 
   const MAX_RECONNECT_ATTEMPTS = 3;
   const ICE_RECONNECT_WAIT = 4000;
   const RECONNECT_BACKOFF = [2000, 4000, 8000];
 
-  // ========== Word list for auto-token ==========
+  // ========== Word list ==========
   const ADJECTIVES = [
     "brave","calm","dark","eager","fair","glad","happy","jolly","keen","lively",
     "merry","noble","proud","quick","rapid","sharp","swift","vivid","warm","wise",
@@ -60,7 +63,7 @@
     if (wakeLock) { wakeLock.release(); wakeLock = null; }
   }
 
-  // ========== Toast notifications ==========
+  // ========== Toast ==========
   function showToast(message, duration = 3000) {
     let container = $("#toast-container");
     if (!container) {
@@ -79,28 +82,22 @@
     }, duration);
   }
 
-  // ========== Screen reader announcer ==========
+  // ========== Screen reader ==========
   function announce(text) {
     const el = $("#sr-announcer");
     if (el) el.textContent = text;
   }
 
-  // ========== Browser compatibility check ==========
+  // ========== Browser compatibility ==========
   function checkCompatibility() {
     const issues = [];
-    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-      issues.push("getUserMedia");
-    }
-    if (!(window.RTCPeerConnection || window.webkitRTCPeerConnection)) {
-      issues.push("RTCPeerConnection");
-    }
-    if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
-      issues.push("https");
-    }
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) issues.push("getUserMedia");
+    if (!(window.RTCPeerConnection || window.webkitRTCPeerConnection)) issues.push("RTCPeerConnection");
+    if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") issues.push("https");
     return issues;
   }
 
-  // --- Audio constraints ---
+  // --- Audio constraints (optimized for low latency voice) ---
   const AUDIO_CONSTRAINTS = {
     audio: {
       echoCancellation: true,
@@ -117,13 +114,16 @@
     video: false,
   };
 
-  // --- ICE config ---
+  // --- ICE config (optimized for 5G + WiFi + restrictive NAT) ---
   const ICE_CONFIG = {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
       { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
       { urls: "stun:global.stun.twilio.com:3478" },
+      // TURN: all transport combos for maximum reachability
       {
         urls: [
           "turn:openrelay.metered.ca:80",
@@ -141,11 +141,17 @@
         username: "openrelayproject",
         credential: "openrelayproject",
       },
+      // Additional TURN endpoints for redundancy
+      {
+        urls: "turn:openrelay.metered.ca:443?transport=udp",
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
     ],
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 2,
+    iceCandidatePoolSize: 4, // Increased from 2 for faster 5G candidate gathering
   };
 
   // --- DOM ---
@@ -176,12 +182,16 @@
     }
   }
 
-  // --- SDP optimization ---
+  // --- SDP optimization (low latency, high quality voice) ---
   function optimizeSDP(sdp) {
     const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
     if (!opusMatch) return sdp;
     const opusPT = opusMatch[1];
-    const fmtpLine = `a=fmtp:${opusPT} minptime=10;useinbandfec=1;maxaveragebitrate=32000;stereo=0;cbr=0;sprop-stereo=0;maxplaybackrate=16000`;
+    // maxaveragebitrate=48000: fullband quality
+    // useinbandfec: packet loss resilience
+    // NO minptime override (let browser default to 20ms, lower latency)
+    // NO maxplaybackrate (unrestricted, lower processing delay)
+    const fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0`;
     const lines = sdp.split("\r\n");
     let replaced = false;
     for (let i = 0; i < lines.length; i++) {
@@ -225,24 +235,20 @@
   }
 
   // --- Adaptive bitrate ---
-  let bitrateAppliedOnce = false;
   async function adaptAudioBitrate(pc, loss, jitter, rtt) {
-    // Skip first call - SDP may not be fully applied yet
     if (!bitrateAppliedOnce) { bitrateAppliedOnce = true; return; }
     const sender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
     if (!sender) return;
     try {
       const params = sender.getParameters();
-      if (!params.encodings || !params.encodings.length) {
-        params.encodings = [{}];
-      }
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
       let targetBitrate;
       if (loss > 10 || jitter > 100 || rtt > 0.5) {
-        targetBitrate = 12000;
+        targetBitrate = 16000;
       } else if (loss > 3 || jitter > 50 || rtt > 0.3) {
-        targetBitrate = 24000;
+        targetBitrate = 32000;
       } else {
-        targetBitrate = 48000;
+        targetBitrate = 64000; // Higher ceiling for good networks
       }
       params.encodings[0].maxBitrate = targetBitrate;
       params.encodings[0].priority = "high";
@@ -250,22 +256,21 @@
     } catch (_) {}
   }
 
-  // --- Jitter buffer tuning ---
+  // --- Jitter buffer (aggressive low-latency for WiFi) ---
   function configureJitterBuffer(pc, jitter) {
     try {
-      const receivers = pc.getReceivers();
-      receivers.forEach((receiver) => {
+      pc.getReceivers().forEach((receiver) => {
         if (receiver.track.kind === "audio" && "jitterBufferTarget" in receiver) {
-          // Adaptive: more jitter = bigger buffer
-          if (jitter < 20) receiver.jitterBufferTarget = 20;
-          else if (jitter < 50) receiver.jitterBufferTarget = 40;
-          else receiver.jitterBufferTarget = 80;
+          if (jitter < 15) receiver.jitterBufferTarget = 10;      // LAN/WiFi: ultra-low
+          else if (jitter < 30) receiver.jitterBufferTarget = 20;  // Good internet
+          else if (jitter < 60) receiver.jitterBufferTarget = 40;  // Moderate
+          else receiver.jitterBufferTarget = 60;                    // Lossy
         }
       });
     } catch (_) {}
   }
 
-  // --- Network migration detection ---
+  // --- Network migration ---
   function setupNetworkMigration(pc) {
     if (!navigator.connection) return;
     let lastType = navigator.connection.effectiveType;
@@ -273,13 +278,103 @@
       const newType = navigator.connection.effectiveType;
       if (newType !== lastType) {
         lastType = newType;
-        showToast(`Network changed to ${newType}. Adjusting...`);
+        showToast(`Network: ${newType}. Adjusting...`);
         try { pc.restartIce(); } catch (_) {}
       }
     });
   }
 
-  // --- Duration ---
+  // ========== Peer count UI ==========
+  function updatePeerCount() {
+    const count = peers.size + 1; // +1 for self
+    const el = $("#peer-count");
+    if (el) el.textContent = count > 1 ? `${count} people` : "Waiting...";
+    const statusEl = $("#call-status-text");
+    if (statusEl && count > 1) statusEl.textContent = count > 2 ? `Group Call (${count})` : "Connected";
+  }
+
+  // ========== Mesh peer management ==========
+  function addPeer(peerId, call, stream) {
+    if (peers.size >= MAX_PEERS) {
+      call.close();
+      showToast("Room is full (max 8 people).");
+      return;
+    }
+
+    const remoteAudio = new Audio();
+    remoteAudio.srcObject = stream;
+    remoteAudio.autoplay = true;
+    remoteAudio.play().catch(() => {});
+
+    let analyser = null;
+    if (audioCtx) {
+      try {
+        const src = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.8;
+        src.connect(analyser);
+      } catch (_) {}
+    }
+
+    peers.set(peerId, { call, remoteAudio, analyser });
+
+    call.on("close", () => removePeer(peerId));
+    call.on("error", () => removePeer(peerId));
+
+    monitorSinglePeerConnection(call.peerConnection);
+    updatePeerCount();
+    if (peers.size === 1) {
+      // First peer connected - show call screen
+      setPhase("connected");
+      startDurationTimer();
+      requestWakeLock();
+      showScreen("call");
+    }
+  }
+
+  function removePeer(peerId) {
+    const info = peers.get(peerId);
+    if (!info) return;
+    info.call.close();
+    if (info.remoteAudio) {
+      info.remoteAudio.pause();
+      info.remoteAudio.srcObject = null;
+    }
+    peers.delete(peerId);
+    updatePeerCount();
+    if (peers.size === 0 && currentToken) {
+      endCall("All peers disconnected.");
+    }
+  }
+
+  function closeAllPeers() {
+    for (const [id, info] of peers) {
+      info.call.close();
+      if (info.remoteAudio) {
+        info.remoteAudio.pause();
+        info.remoteAudio.srcObject = null;
+      }
+    }
+    peers.clear();
+  }
+
+  // ========== Connection monitoring (per-peer) ==========
+  function monitorSinglePeerConnection(pc) {
+    if (!pc) return;
+    setupNetworkMigration(pc);
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      if (state === "connected" || state === "completed") {
+        reconnectAttempts = 0;
+        bitrateAppliedOnce = false;
+        startStatsMonitor(pc);
+      }
+    };
+  }
+
+  // ========== Duration ==========
   function startDurationTimer() {
     callStartTime = Date.now();
     durationTimer = setInterval(() => {
@@ -300,7 +395,6 @@
     const order = ["signaling", "ice", "connected"];
     const idx = order.indexOf(name);
     const label = { signaling: "Establishing signaling...", ice: "Negotiating connection...", connected: "Connected" };
-
     document.querySelectorAll(".phase-step").forEach((el) => {
       const p = el.dataset.phase;
       const pi = order.indexOf(p);
@@ -321,33 +415,21 @@
     if (!generateQR._loaded) {
       const script = document.createElement("script");
       script.src = "https://cdn.jsdelivr.net/npm/qrcode@latest/build/qrcode.min.js";
-      script.onload = () => {
-        generateQR._loaded = true;
-        generateQR(text, imgEl, size);
-      };
-      script.onerror = () => {
-        imgEl.style.display = "none";
-      };
+      script.onload = () => { generateQR._loaded = true; generateQR(text, imgEl, size); };
+      script.onerror = () => { imgEl.style.display = "none"; };
       document.head.appendChild(script);
       return;
     }
-
     try {
       QRCode.toDataURL(text, {
-        width: size,
-        margin: 2,
+        width: size, margin: 2,
         color: { dark: "#4f9cf7", light: "#1a1a1a" },
         errorCorrectionLevel: "M",
       }, (err, url) => {
-        if (!err && url) {
-          imgEl.src = url;
-        } else {
-          imgEl.style.display = "none";
-        }
+        if (!err && url) imgEl.src = url;
+        else imgEl.style.display = "none";
       });
-    } catch (_) {
-      imgEl.style.display = "none";
-    }
+    } catch (_) { imgEl.style.display = "none"; }
   }
 
   // ========== Speaking detection ==========
@@ -365,24 +447,24 @@
 
   function updateSpeakingIndicators() {
     const localRMS = getRMS(localAnalyser);
-    const remoteRMS = getRMS(remoteAnalyser);
-
     const localLabel = $("#label-local");
-    const remoteLabel = $("#label-remote");
     if (localLabel) localLabel.classList.toggle("speaking", localRMS > 0.05 && !isMuted);
-    if (remoteLabel) remoteLabel.classList.toggle("speaking", remoteRMS > 0.05);
+
+    // Check if ANY remote peer is speaking
+    let anyRemoteSpeaking = false;
+    for (const [, info] of peers) {
+      if (getRMS(info.analyser) > 0.05) { anyRemoteSpeaking = true; break; }
+    }
+    const remoteLabel = $("#label-remote");
+    if (remoteLabel) remoteLabel.classList.toggle("speaking", anyRemoteSpeaking);
   }
 
   // ========== Audio Visualizer ==========
-  function initAudioViz(remoteStream) {
+  function initAudioViz() {
     try {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
     } catch (_) { return; }
-
-    // iOS Safari: AudioContext starts suspended, must resume after user gesture
-    if (audioCtx.state === "suspended") {
-      audioCtx.resume().catch(() => {});
-    }
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
 
     const localSrc = audioCtx.createMediaStreamSource(localStream);
     localAnalyser = audioCtx.createAnalyser();
@@ -390,20 +472,11 @@
     localAnalyser.smoothingTimeConstant = 0.8;
     localSrc.connect(localAnalyser);
 
-    if (remoteStream) {
-      const remoteSrc = audioCtx.createMediaStreamSource(remoteStream);
-      remoteAnalyser = audioCtx.createAnalyser();
-      remoteAnalyser.fftSize = 256;
-      remoteAnalyser.smoothingTimeConstant = 0.8;
-      remoteSrc.connect(remoteAnalyser);
-    }
-
     drawVisualizer();
     setupCanvasResize();
     logAudioLatency();
   }
 
-  // Resize canvas on window resize / orientation change
   let resizeTimer = null;
   function setupCanvasResize() {
     const onResize = () => {
@@ -414,9 +487,7 @@
       }, 150);
     };
     window.addEventListener("resize", onResize);
-    if (screen.orientation) {
-      screen.orientation.addEventListener("change", onResize);
-    }
+    if (screen.orientation) screen.orientation.addEventListener("change", onResize);
   }
 
   function logAudioLatency() {
@@ -424,22 +495,15 @@
     const base = (audioCtx.baseLatency || 0) * 1000;
     const output = (audioCtx.outputLatency || 0) * 1000;
     const total = Math.round(base + output);
-    if (total > 0) {
-      showToast(`Audio pipeline latency: ${total}ms`, 2500);
-    }
+    if (total > 0) showToast(`Audio latency: ${total}ms`, 2500);
   }
 
   function drawVisualizer() {
     const canvas = $("#visualizer");
     if (!canvas) return;
-
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
-    // If canvas isn't laid out yet (just shown), retry next frame
-    if (rect.width === 0) {
-      requestAnimationFrame(() => drawVisualizer());
-      return;
-    }
+    if (rect.width === 0) { requestAnimationFrame(() => drawVisualizer()); return; }
     const W = rect.width * dpr;
     const H = rect.height * dpr;
     canvas.width = W;
@@ -451,20 +515,35 @@
     const logicalH = rect.height;
     const bufLen = localAnalyser ? localAnalyser.frequencyBinCount : 128;
     const localData = new Uint8Array(bufLen);
-    const remoteData = new Uint8Array(bufLen);
+
+    // Collect remote data from all peers (merged)
+    const remoteMerged = new Uint8Array(bufLen);
 
     function draw() {
       vizRAF = requestAnimationFrame(draw);
       ctx.clearRect(0, 0, logicalW, logicalH);
 
       if (localAnalyser) localAnalyser.getByteFrequencyData(localData);
-      if (remoteAnalyser) remoteAnalyser.getByteFrequencyData(remoteData);
+
+      // Merge all remote peer frequency data
+      remoteMerged.fill(0);
+      let remoteCount = 0;
+      for (const [, info] of peers) {
+        if (info.analyser) {
+          const tmp = new Uint8Array(bufLen);
+          info.analyser.getByteFrequencyData(tmp);
+          for (let i = 0; i < bufLen; i++) {
+            remoteMerged[i] = Math.max(remoteMerged[i], tmp[i]);
+          }
+          remoteCount++;
+        }
+      }
 
       const barCount = 40;
       const barW = (logicalW - (barCount - 1) * 2) / barCount;
       const step = Math.floor(bufLen / barCount);
 
-      drawBars(ctx, remoteData, barCount, barW, step, logicalW, logicalH, "#22c55e", 0.7, true);
+      drawBars(ctx, remoteMerged, barCount, barW, step, logicalW, logicalH, "#22c55e", 0.7, true);
       drawBars(ctx, localData, barCount, barW, step, logicalW, logicalH, "#4f9cf7", 0.8, false);
       updateSpeakingIndicators();
     }
@@ -481,9 +560,8 @@
       ctx.fillStyle = color;
       ctx.globalAlpha = alpha * (0.3 + val * 0.7);
       const x = i * (barW + 2);
-      const radius = Math.min(barW / 2, 3);
-      if (fromBottom) roundRect(ctx, x, centerY - barH, barW, barH, radius);
-      else roundRect(ctx, x, centerY, barW, barH, radius);
+      if (fromBottom) roundRect(ctx, x, centerY - barH, barW, barH, Math.min(barW / 2, 3));
+      else roundRect(ctx, x, centerY, barW, barH, Math.min(barW / 2, 3));
     }
     ctx.globalAlpha = 1;
   }
@@ -506,9 +584,7 @@
     if (vizRAF) cancelAnimationFrame(vizRAF);
     vizRAF = null;
     localAnalyser = null;
-    remoteAnalyser = null;
     clearTimeout(resizeTimer);
-    window.removeEventListener("resize", drawVisualizer);
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   }
 
@@ -534,13 +610,8 @@
     const el = $("#quality-segments");
     el.setAttribute("data-quality", level);
     $("#quality-label").textContent = label;
-
-    // Toast on quality transitions
-    if (lastQualityScore >= 4 && level <= 2 && level > 0) {
-      showToast("Connection quality degraded. Audio may be interrupted.");
-    } else if (lastQualityScore <= 2 && level >= 4) {
-      showToast("Connection quality restored.");
-    }
+    if (lastQualityScore >= 4 && level <= 2 && level > 0) showToast("Quality degraded.");
+    else if (lastQualityScore <= 2 && level >= 4) showToast("Quality restored.");
     if (level > 0) lastQualityScore = level;
   }
 
@@ -548,15 +619,12 @@
     const lv = $("#metric-latency");
     const jv = $("#metric-jitter");
     const lo = $("#metric-loss");
-
     lv.textContent = latency >= 0 ? Math.round(latency) : "--";
     jv.textContent = jitter >= 0 ? Math.round(jitter) : "--";
     lo.textContent = loss >= 0 ? loss.toFixed(1) + "%" : "--";
-
     lv.style.color = latency < 0 ? "" : latency < 100 ? "var(--success)" : latency < 300 ? "var(--warning)" : "var(--danger)";
     jv.style.color = jitter < 0 ? "" : jitter < 30 ? "var(--success)" : jitter < 80 ? "var(--warning)" : "var(--danger)";
     lo.style.color = loss < 0 ? "" : loss < 2 ? "var(--success)" : loss < 5 ? "var(--warning)" : "var(--danger)";
-
     if (latency >= 0) {
       let score = 5;
       if (latency > 150) score--;
@@ -565,8 +633,7 @@
       if (loss > 3) score--;
       if (loss > 8) score--;
       score = Math.max(1, score);
-      const labels = { 1: "Terrible", 2: "Poor", 3: "Fair", 4: "Good", 5: "Excellent" };
-      setQuality(score, labels[score]);
+      setQuality(score, { 1: "Terrible", 2: "Poor", 3: "Fair", 4: "Good", 5: "Excellent" }[score]);
     }
   }
 
@@ -574,8 +641,9 @@
   function startStatsMonitor(pc) {
     prevStats = null;
     let consecBad = 0;
+    if (statsInterval) return; // Already running
     statsInterval = setInterval(() => {
-      if (statsPaused) return; // Skip when tab is hidden
+      if (statsPaused) return;
       if (!pc || pc.connectionState === "closed") { stopStatsMonitor(); return; }
       pc.getStats().then((stats) => {
         let isRelay = false;
@@ -606,17 +674,13 @@
           });
           updateMetrics(latency, jitter, loss);
           setConnType(isRelay ? "relay" : "p2p");
-
-          // Adaptive bitrate + jitter buffer tuning
           const rtt = currentPair.currentRoundTripTime || 0;
           adaptAudioBitrate(pc, loss, jitter, rtt);
           configureJitterBuffer(pc, jitter);
           if (loss > 15 || latency > 500) {
             consecBad++;
-            if (consecBad >= 3 && currentCall) { attemptICERestart(); consecBad = 0; }
-          } else {
-            consecBad = 0;
-          }
+            if (consecBad >= 3) { attemptICERestart(pc); consecBad = 0; }
+          } else { consecBad = 0; }
         }
       }).catch(() => {});
     }, 2000);
@@ -630,12 +694,10 @@
   }
 
   // ========== ICE restart & reconnection ==========
-  function attemptICERestart() {
-    if (!currentCall || !currentCall.peerConnection) return;
-    const pc = currentCall.peerConnection;
-    if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-      try { pc.restartIce(); } catch (_) {}
-    }
+  function attemptICERestart(pc) {
+    const target = pc || (peers.values().next().value?.call?.peerConnection);
+    if (!target) return;
+    try { target.restartIce(); } catch (_) {}
   }
 
   function scheduleReconnect() {
@@ -647,19 +709,13 @@
     setConnType("disconnected");
     updateMetrics(-1, -1, -1);
     setQuality(0, "Reconnecting...");
-    const lbl = $("#phase-label");
-    if (lbl) lbl.textContent = `Reconnecting in ${Math.ceil(delay / 1000)}s (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`;
     announce("Connection lost. Reconnecting.");
 
     clearReconnectTimer();
     reconnectTimer = setTimeout(async () => {
       reconnectAttempts++;
       if (!currentToken) { endCall("Connection lost."); return; }
-      if (currentCall) {
-        currentCall.close();
-        if (currentCall._remoteAudio) { currentCall._remoteAudio.pause(); currentCall._remoteAudio.srcObject = null; }
-        currentCall = null;
-      }
+      closeAllPeers();
       stopAudioViz();
       stopStatsMonitor();
       destroyPeer();
@@ -667,8 +723,7 @@
       if (currentToken) showShareLink(currentToken);
       setPhase("signaling");
       try {
-        const result = await connectPeer(currentToken);
-        peer = result.peer;
+        await connectPeer(currentToken);
       } catch (err) {
         endCall("Reconnection failed: " + (err.message || "unknown error"));
       }
@@ -679,154 +734,130 @@
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   }
 
-  // ========== Peer connection monitoring ==========
-  function monitorPeerConnection(call) {
-    const pc = call.peerConnection;
-    if (!pc) return;
-    iceRestarted = false;
-    setupNetworkMigration(pc);
-
-    pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
-      switch (state) {
-        case "checking": setConnType("checking"); break;
-        case "connected":
-        case "completed":
-          reconnectAttempts = 0;
-          iceRestarted = false;
-          startStatsMonitor(pc);
-          announce("Connected. Call active.");
-          break;
-        case "disconnected":
-          if (!iceRestarted) {
-            iceRestarted = true;
-            setConnType("disconnected");
-            setTimeout(() => { if (pc.iceConnectionState === "disconnected") attemptICERestart(); }, ICE_RECONNECT_WAIT);
-          } else { scheduleReconnect(); }
-          break;
-        case "failed": scheduleReconnect(); break;
-      }
-    };
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") scheduleReconnect();
-    };
-  }
-
-  // --- Call handling ---
-  function handleCall(call) {
-    currentCall = call;
-    clearCallTimeout();
-    setPhase("connected");
+  // ========== Mesh connection handling ==========
+  function handleIncomingCall(call) {
     applySDPOptimization(call);
-
     call.on("stream", (remoteStream) => {
-      const audio = new Audio();
-      audio.srcObject = remoteStream;
-      audio.autoplay = true;
-      // iOS/Safari: explicit play() may be needed even with autoplay
-      audio.play().catch(() => {});
-      currentCall._remoteAudio = audio;
-      initAudioViz(remoteStream);
+      addPeer(call.peer, call, remoteStream);
     });
-    call.on("close", () => endCall("Peer disconnected"));
-    call.on("error", (err) => endCall("Call error: " + err.type));
-
-    monitorPeerConnection(call);
-    startDurationTimer();
-    requestWakeLock();
-    setTimeout(() => showScreen("call"), 400);
+    call.answer(localStream);
   }
 
-  // --- Call timeout ---
-  let callTimeoutId = null;
-  function setCallTimeout() { clearCallTimeout(); callTimeoutId = setTimeout(() => endCall("No answer. The other user may have left."), 15000); }
-  function clearCallTimeout() { if (callTimeoutId) { clearTimeout(callTimeoutId); callTimeoutId = null; } }
-
-  function endCall(reason) {
-    clearCallTimeout();
-    clearReconnectTimer();
-    stopDurationTimer();
-    stopAudioViz();
-    stopStatsMonitor();
-    releaseWakeLock();
-    reconnectAttempts = 0;
-    iceRestarted = false;
-    bitrateAppliedOnce = false;
-    if (currentCall) {
-      currentCall.close();
-      if (currentCall._remoteAudio) { currentCall._remoteAudio.pause(); currentCall._remoteAudio.srcObject = null; }
-      currentCall = null;
-    }
-    stopLocalStream();
-    destroyPeer();
-    $("#disconnect-reason").textContent = reason || "The call has ended";
-    // Dynamic title based on reason
-    const titleEl = $("#disconnect-title");
-    if (titleEl) {
-      if (reason && (reason.includes("lost") || reason.includes("failed") || reason.includes("timeout"))) {
-        titleEl.textContent = "Connection Lost";
-      } else {
-        titleEl.textContent = "Call Ended";
-      }
-    }
-    // Show retry button only if we have a token (reconnectable)
-    const retryBtn = $("#btn-retry");
-    if (retryBtn) retryBtn.style.display = currentToken ? "" : "none";
-    announce("Call ended. " + (reason || ""));
-    showScreen("disconnected");
+  function initiateCall(targetPeerId) {
+    if (peers.has(targetPeerId)) return; // Already connected
+    const call = peer.call(targetPeerId, localStream);
+    if (!call) return;
+    applySDPOptimization(call);
+    call.on("stream", (remoteStream) => {
+      addPeer(targetPeerId, call, remoteStream);
+    });
+    call.on("close", () => removePeer(targetPeerId));
+    call.on("error", () => removePeer(targetPeerId));
   }
 
-  function destroyPeer() { if (peer) { peer.destroy(); peer = null; } }
+  // ========== PeerJS connection ==========
+  function getRoomPeerIds(token) {
+    // Generate all possible peer IDs for this room
+    const ids = [`isay-${token}-host`];
+    for (let i = 0; i < MAX_PEERS; i++) {
+      ids.push(`isay-${token}-g${i}`);
+    }
+    return ids;
+  }
 
-  // --- PeerJS connection ---
   async function connectPeer(token) {
-    const hostId = `isay-${token}-host`;
     currentToken = token;
+    currentRole = null;
 
-    return new Promise(async (resolve, reject) => {
-      try {
-        await getLocalStream();
-      } catch (err) {
-        const name = err.name;
-        if (name === "NotAllowedError") reject(new Error("Microphone blocked. Open browser settings, allow microphone for this site, then reload."));
-        else if (name === "NotFoundError") reject(new Error("No microphone detected. Connect a microphone or headset."));
-        else if (name === "NotReadableError") reject(new Error("Microphone in use. Close other apps (Zoom, Teams) and try again."));
-        else reject(new Error("Microphone access denied. Please allow permission."));
-        return;
-      }
+    try {
+      await getLocalStream();
+    } catch (err) {
+      const name = err.name;
+      if (name === "NotAllowedError") throw new Error("Microphone blocked. Allow in browser settings, then reload.");
+      if (name === "NotFoundError") throw new Error("No microphone detected. Connect a headset.");
+      if (name === "NotReadableError") throw new Error("Microphone in use. Close Zoom/Teams and retry.");
+      throw new Error("Microphone access denied.");
+    }
 
-      setPhase("signaling");
-      let isHost = false;
+    setPhase("signaling");
+
+    // Try to claim host slot
+    const hostId = `isay-${token}-host`;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (!currentRole) { p.destroy(); reject(new Error("Connection timed out. Make sure the other person has the link open.")); }
+      }, 12000);
 
       const p = new Peer(hostId, { debug: 0, config: ICE_CONFIG });
 
-      p.on("open", (id) => {
-        isHost = true;
+      p.on("open", () => {
         currentRole = "host";
+        peer = p;
         setPhase("ice");
-        p.on("call", (call) => { call.answer(localStream); handleCall(call); });
-        resolve({ peer: p, role: "host" });
+        clearTimeout(timeout);
+
+        // Listen for all incoming calls (mesh)
+        p.on("call", (call) => handleIncomingCall(call));
+        initAudioViz();
+        resolve({ role: "host" });
       });
 
       p.on("error", (err) => {
-        if (err.type === "unavailable-id" && !isHost) {
+        if (err.type === "unavailable-id" && !currentRole) {
+          // Host taken - become guest
           p.destroy();
-          const guestId = `isay-${token}-guest-${Math.random().toString(36).slice(2, 8)}`;
-          const guestPeer = new Peer(guestId, { debug: 0, config: ICE_CONFIG });
+          let guestIdx = 0;
+          const tryGuest = () => {
+            if (guestIdx >= MAX_PEERS) {
+              clearTimeout(timeout);
+              reject(new Error("Room is full."));
+              return;
+            }
+            const guestId = `isay-${token}-g${guestIdx}`;
+            const gp = new Peer(guestId, { debug: 0, config: ICE_CONFIG });
 
-          guestPeer.on("open", () => {
-            currentRole = "guest";
-            setPhase("ice");
-            const call = guestPeer.call(hostId, localStream);
-            if (call) { setCallTimeout(); handleCall(call); }
-            else { reject(new Error("Failed to initiate call")); return; }
-            resolve({ peer: guestPeer, role: "guest" });
-          });
-          guestPeer.on("error", (guestErr) => reject(guestErr));
-        } else if (!isHost) { reject(err); }
+            gp.on("open", () => {
+              currentRole = "guest";
+              peer = gp;
+              setPhase("ice");
+              clearTimeout(timeout);
+
+              gp.on("call", (call) => handleIncomingCall(call));
+
+              // Initiate audio viz for local stream
+              initAudioViz();
+
+              // Connect to all existing peers in room
+              const allIds = getRoomPeerIds(token);
+              for (const id of allIds) {
+                if (id !== guestId) {
+                  // Try connecting with a stagger to avoid overwhelming
+                  setTimeout(() => {
+                    if (peer && peer.open) initiateCall(id);
+                  }, guestIdx * 200);
+                }
+              }
+
+              resolve({ role: "guest" });
+            });
+
+            gp.on("error", (guestErr) => {
+              if (guestErr.type === "unavailable-id") {
+                gp.destroy();
+                guestIdx++;
+                tryGuest();
+              } else {
+                clearTimeout(timeout);
+                reject(guestErr);
+              }
+            });
+          };
+          tryGuest();
+        } else if (!currentRole) {
+          clearTimeout(timeout);
+          reject(err);
+        }
       });
-
-      setTimeout(() => { if (!isHost && !peer) { p.destroy(); reject(new Error("Connection timed out. Make sure the other person has the link open.")); } }, 10000);
     });
   }
 
@@ -849,25 +880,14 @@
     const link = $("#share-link").value;
     const hint = $("#copy-hint");
     const btn = $("#btn-copy-link");
-
     const showCopied = () => {
       btn.classList.add("copied");
       hint.textContent = "Copied!";
       haptic(20);
       setTimeout(() => { btn.classList.remove("copied"); hint.textContent = ""; }, 2000);
     };
-
-    // Mobile: try Web Share API first
-    if (navigator.share && /Mobi|Android/i.test(navigator.userAgent)) {
-      navigator.share({ title: "Join my voice chat", text: "Join my iSay room", url: link }).catch(() => {});
-      return;
-    }
-
-    // Modern browsers
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(link).then(showCopied).catch(() => {
-        fallbackCopy(link, hint, showCopied);
-      });
+      navigator.clipboard.writeText(link).then(showCopied).catch(() => fallbackCopy(link, hint, showCopied));
     } else {
       fallbackCopy(link, hint, showCopied);
     }
@@ -876,16 +896,11 @@
   function fallbackCopy(text, hintEl, onSuccess) {
     const input = $("#share-link");
     input.select();
-    input.setSelectionRange(0, 99999); // iOS Safari requires this
-    try {
-      document.execCommand("copy");
-      onSuccess();
-    } catch (_) {
-      hintEl.textContent = "Press Ctrl+C to copy";
-    }
+    input.setSelectionRange(0, 99999);
+    try { document.execCommand("copy"); onSuccess(); }
+    catch (_) { hintEl.textContent = "Press Ctrl+C to copy"; }
   }
 
-  // --- Haptic feedback ---
   function haptic(pattern) {
     if ("vibrate" in navigator) { try { navigator.vibrate(pattern); } catch (_) {} }
   }
@@ -901,9 +916,12 @@
     showShareLink(token);
 
     try {
-      const result = await connectPeer(token);
-      peer = result.peer;
-      if (result.role === "host") $("#call-status-text").textContent = "Connected";
+      await connectPeer(token);
+      // Host stays on waiting screen until someone joins
+      // Guest: if no one else is in the room yet, show waiting
+      if (peers.size === 0) {
+        // Waiting for others to connect back to us
+      }
     } catch (err) {
       destroyPeer();
       stopLocalStream();
@@ -922,11 +940,40 @@
     $("#mute-label").textContent = isMuted ? "Unmute" : "Mute";
     $("#btn-mute").setAttribute("aria-pressed", isMuted);
     haptic(isMuted ? 30 : [20, 10, 20]);
-    announce(isMuted ? "Microphone muted" : "Microphone unmuted");
+    announce(isMuted ? "Muted" : "Unmuted");
   }
 
-  function restart() {
+  function endCall(reason) {
+    clearCallTimeout();
+    clearReconnectTimer();
+    stopDurationTimer();
+    stopAudioViz();
+    stopStatsMonitor();
+    releaseWakeLock();
+    reconnectAttempts = 0;
+    bitrateAppliedOnce = false;
+    closeAllPeers();
+    stopLocalStream();
     destroyPeer();
+    $("#disconnect-reason").textContent = reason || "The call has ended";
+    const titleEl = $("#disconnect-title");
+    if (titleEl) {
+      titleEl.textContent = (reason && (reason.includes("lost") || reason.includes("failed"))) ? "Connection Lost" : "Call Ended";
+    }
+    const retryBtn = $("#btn-retry");
+    if (retryBtn) retryBtn.style.display = currentToken ? "" : "none";
+    announce("Call ended. " + (reason || ""));
+    showScreen("disconnected");
+  }
+
+  function destroyPeer() { if (peer) { peer.destroy(); peer = null; } }
+
+  let callTimeoutId = null;
+  function setCallTimeout() { clearCallTimeout(); callTimeoutId = setTimeout(() => endCall("No answer."), 20000); }
+  function clearCallTimeout() { if (callTimeoutId) { clearTimeout(callTimeoutId); callTimeoutId = null; } }
+
+  function restart() {
+    closeAllPeers();
     stopLocalStream();
     stopAudioViz();
     stopStatsMonitor();
@@ -949,19 +996,12 @@
   document.addEventListener("visibilitychange", async () => {
     if (document.visibilityState === "visible") {
       statsPaused = false;
-      if (currentCall) {
+      if (peers.size > 0) {
         await requestWakeLock();
-        if (audioCtx && audioCtx.state === "suspended") {
-          audioCtx.resume().catch(() => {});
-        }
-        const pc = currentCall.peerConnection;
-        if (pc && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
-          attemptICERestart();
-          showToast("Reconnecting after background...");
-        }
+        if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
       }
     } else {
-      statsPaused = true; // Save CPU/battery when tab is hidden
+      statsPaused = true;
     }
   });
 
@@ -969,25 +1009,17 @@
   $("#btn-join").addEventListener("click", () => joinRoom());
   $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
   $("#btn-copy-link").addEventListener("click", copyShareLink);
-  $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); showScreen("landing"); });
+  $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing"); });
   $("#btn-mute").addEventListener("click", toggleMute);
   $("#btn-hangup").addEventListener("click", () => endCall("You ended the call"));
   $("#btn-restart").addEventListener("click", restart);
-  $("#btn-retry").addEventListener("click", () => {
-    if (currentToken) joinRoom(currentToken);
-    else restart();
-  });
+  $("#btn-retry").addEventListener("click", () => { if (currentToken) joinRoom(currentToken); else restart(); });
 
-  // Space key to toggle mute during call
   document.addEventListener("keydown", (e) => {
-    if (e.code === "Space" && currentCall && !e.repeat) {
-      e.preventDefault();
-      toggleMute();
-    }
+    if (e.code === "Space" && peers.size > 0 && !e.repeat) { e.preventDefault(); toggleMute(); }
   });
 
   // ========== Init ==========
-  // Compatibility check
   const compatIssues = checkCompatibility();
   if (compatIssues.includes("RTCPeerConnection") || compatIssues.includes("getUserMedia")) {
     $("#screen-landing").innerHTML = `
@@ -998,17 +1030,10 @@
       </div>`;
     return;
   }
-  if (compatIssues.includes("https")) {
-    showToast("HTTPS required for microphone. Open via https:// or localhost.", 8000);
-  }
+  if (compatIssues.includes("https")) showToast("HTTPS required. Open via https:// or localhost.", 8000);
 
-  // Auto-generate token
-  const tokenInput = $("#token-input");
   const hashParams = new URLSearchParams(window.location.hash.slice(1));
   const urlToken = hashParams.get("token") || hashParams.get("room");
-  if (urlToken) {
-    joinRoom(urlToken);
-  } else {
-    tokenInput.value = generateToken();
-  }
+  if (urlToken) joinRoom(urlToken);
+  else $("#token-input").value = generateToken();
 })();
