@@ -149,6 +149,58 @@ button:active {
   border-color: var(--primary);
 }
 
+/* Share link box */
+.share-link-box {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+  max-width: 100%;
+}
+
+.share-link-box input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--primary);
+  font-size: 0.85rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  outline: none;
+  cursor: text;
+}
+
+.share-link-box button {
+  padding: 10px 14px;
+  min-width: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+.share-link-box button:hover {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.share-link-box button.copied {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+#copy-hint {
+  min-height: 1.2em;
+}
+
 /* Spinner */
 .spinner {
   width: 48px;

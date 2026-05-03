@@ -261,16 +261,55 @@
     });
   }
 
-  // --- UI Events ---
-  async function joinRoom() {
-    const tokenInput = $("#token-input");
-    const token = tokenInput.value.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
-    if (!token) {
-      tokenInput.focus();
+  // --- Share link ---
+  function buildShareLink(token) {
+    const url = new URL(window.location.href);
+    url.hash = `token=${token}`;
+    url.search = "";
+    return url.toString();
+  }
+
+  function showShareLink(token) {
+    const link = buildShareLink(token);
+    const input = $("#share-link");
+    input.value = link;
+  }
+
+  function copyShareLink() {
+    const link = $("#share-link").value;
+    const hint = $("#copy-hint");
+    const btn = $("#btn-copy-link");
+
+    if (navigator.share) {
+      navigator.share({ title: "iSay Voice Chat", url: link }).catch(() => {});
       return;
     }
 
-    $("#token-display").textContent = token;
+    navigator.clipboard.writeText(link).then(() => {
+      btn.classList.add("copied");
+      hint.textContent = "Copied!";
+      setTimeout(() => {
+        btn.classList.remove("copied");
+        hint.textContent = "";
+      }, 2000);
+    }).catch(() => {
+      $("#share-link").select();
+      hint.textContent = "Press Ctrl+C to copy";
+    });
+  }
+
+  // --- UI Events ---
+  async function joinRoom(token) {
+    if (typeof token !== "string") {
+      token = $("#token-input").value;
+    }
+    token = token.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
+    if (!token) {
+      $("#token-input").focus();
+      return;
+    }
+
+    showShareLink(token);
     showScreen("waiting");
 
     try {
@@ -315,10 +354,11 @@
   }
 
   // --- Event binding ---
-  $("#btn-join").addEventListener("click", joinRoom);
+  $("#btn-join").addEventListener("click", () => joinRoom());
   $("#token-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") joinRoom();
   });
+  $("#btn-copy-link").addEventListener("click", copyShareLink);
   $("#btn-cancel-wait").addEventListener("click", () => {
     destroyPeer();
     stopLocalStream();
@@ -328,10 +368,10 @@
   $("#btn-hangup").addEventListener("click", () => endCall("You ended the call"));
   $("#btn-restart").addEventListener("click", restart);
 
-  // Check for token in URL hash
+  // Auto-connect if token in URL hash
   const hashParams = new URLSearchParams(window.location.hash.slice(1));
   const urlToken = hashParams.get("token") || hashParams.get("room");
   if (urlToken) {
-    $("#token-input").value = urlToken;
+    joinRoom(urlToken);
   }
 })();
