@@ -399,15 +399,43 @@
     }
 
     drawVisualizer();
+    setupCanvasResize();
+    logAudioLatency();
+  }
+
+  // Resize canvas on window resize / orientation change
+  let resizeTimer = null;
+  function setupCanvasResize() {
+    const onResize = () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (vizRAF) { cancelAnimationFrame(vizRAF); vizRAF = null; }
+        drawVisualizer();
+      }, 150);
+    };
+    window.addEventListener("resize", onResize);
+    if (screen.orientation) {
+      screen.orientation.addEventListener("change", onResize);
+    }
+  }
+
+  function logAudioLatency() {
+    if (!audioCtx) return;
+    const base = (audioCtx.baseLatency || 0) * 1000;
+    const output = (audioCtx.outputLatency || 0) * 1000;
+    const total = Math.round(base + output);
+    if (total > 0) {
+      showToast(`Audio pipeline latency: ${total}ms`, 2500);
+    }
   }
 
   function drawVisualizer() {
     const canvas = $("#visualizer");
     if (!canvas) return;
 
-    // DPI-aware canvas sizing for Retina/HiDPI displays
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0) return; // canvas not visible yet
     const W = rect.width * dpr;
     const H = rect.height * dpr;
     canvas.width = W;
@@ -475,6 +503,8 @@
     vizRAF = null;
     localAnalyser = null;
     remoteAnalyser = null;
+    clearTimeout(resizeTimer);
+    window.removeEventListener("resize", drawVisualizer);
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   }
 
@@ -536,10 +566,12 @@
     }
   }
 
+  let statsPaused = false;
   function startStatsMonitor(pc) {
     prevStats = null;
     let consecBad = 0;
     statsInterval = setInterval(() => {
+      if (statsPaused) return; // Skip when tab is hidden
       if (!pc || pc.connectionState === "closed") { stopStatsMonitor(); return; }
       pc.getStats().then((stats) => {
         let isRelay = false;
@@ -628,6 +660,7 @@
       stopStatsMonitor();
       destroyPeer();
       showScreen("waiting");
+      if (currentToken) showShareLink(currentToken);
       setPhase("signaling");
       try {
         const result = await connectPeer(currentToken);
@@ -723,6 +756,18 @@
     stopLocalStream();
     destroyPeer();
     $("#disconnect-reason").textContent = reason || "The call has ended";
+    // Dynamic title based on reason
+    const titleEl = $("#disconnect-title");
+    if (titleEl) {
+      if (reason && (reason.includes("lost") || reason.includes("failed") || reason.includes("timeout"))) {
+        titleEl.textContent = "Connection Lost";
+      } else {
+        titleEl.textContent = "Call Ended";
+      }
+    }
+    // Show retry button only if we have a token (reconnectable)
+    const retryBtn = $("#btn-retry");
+    if (retryBtn) retryBtn.style.display = currentToken ? "" : "none";
     announce("Call ended. " + (reason || ""));
     showScreen("disconnected");
   }
@@ -898,18 +943,21 @@
 
   // ========== Background / Foreground ==========
   document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState === "visible" && currentCall) {
-      await requestWakeLock();
-      // Resume AudioContext if suspended (iOS phone call interruption)
-      if (audioCtx && audioCtx.state === "suspended") {
-        audioCtx.resume().catch(() => {});
+    if (document.visibilityState === "visible") {
+      statsPaused = false;
+      if (currentCall) {
+        await requestWakeLock();
+        if (audioCtx && audioCtx.state === "suspended") {
+          audioCtx.resume().catch(() => {});
+        }
+        const pc = currentCall.peerConnection;
+        if (pc && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
+          attemptICERestart();
+          showToast("Reconnecting after background...");
+        }
       }
-      // Check ICE state on return
-      const pc = currentCall.peerConnection;
-      if (pc && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
-        attemptICERestart();
-        showToast("Reconnecting after background...");
-      }
+    } else {
+      statsPaused = true; // Save CPU/battery when tab is hidden
     }
   });
 
@@ -921,6 +969,10 @@
   $("#btn-mute").addEventListener("click", toggleMute);
   $("#btn-hangup").addEventListener("click", () => endCall("You ended the call"));
   $("#btn-restart").addEventListener("click", restart);
+  $("#btn-retry").addEventListener("click", () => {
+    if (currentToken) joinRoom(currentToken);
+    else restart();
+  });
 
   // Space key to toggle mute during call
   document.addEventListener("keydown", (e) => {
