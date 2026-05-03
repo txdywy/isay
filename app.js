@@ -15,11 +15,13 @@
   let reconnectAttempts = 0;
   let currentToken = null;
   let currentRole = null;              // "host" or "guest"
+  let currentPeerId = null;
   let wakeLock = null;
   let lastQualityScore = -1;
   let currentAudioOutput = "default";
   let speakerOn = true;
   let networkMigrationInitialized = false;
+  let meshScanTimer = null;
 
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
@@ -32,6 +34,7 @@
   const CALL_STREAM_TIMEOUT = 12000;
   const HOST_RETRY_DELAYS = [0, 2500, 6500];
   const MESH_CONNECT_DELAY = 900;
+  const MESH_SCAN_INTERVAL = 8000;
 
   // ========== Word list ==========
   const ADJECTIVES = [
@@ -404,6 +407,7 @@
     updatePeerCount();
     if (peers.size === 1) {
       // First peer connected - show call screen
+      clearMeshScanTimer();
       setPhase("connected");
       startDurationTimer();
       requestWakeLock();
@@ -454,6 +458,13 @@
   function clearAllPendingCalls() {
     for (const peerId of pendingCalls.keys()) {
       clearPendingCall(peerId);
+    }
+  }
+
+  function clearMeshScanTimer() {
+    if (meshScanTimer) {
+      clearInterval(meshScanTimer);
+      meshScanTimer = null;
     }
   }
 
@@ -998,7 +1009,7 @@
         const retryDelay = retryDelays[attempt] ?? 1500;
         setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
       } else if (options.required && peers.size === 0 && currentToken) {
-        endCall("No answer. Ask the other person to keep the call page open, then reconnect.");
+        startMeshScan(currentToken);
       }
     }, CALL_STREAM_TIMEOUT);
 
@@ -1018,7 +1029,7 @@
       if (!peers.has(targetPeerId) && attempt < maxAttempts) {
         retryCall(targetPeerId, options);
       } else if (options.required && peers.size === 0 && currentToken) {
-        endCall("No answer. Ask the other person to keep the call page open, then reconnect.");
+        startMeshScan(currentToken);
       }
     });
   }
@@ -1030,6 +1041,31 @@
     const retryDelays = options.retryDelays || [];
     const retryDelay = retryDelays[attempt] ?? 1500;
     setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
+  }
+
+  function startMeshScan(token) {
+    if (!peer || !peer.open || peers.size > 0) return;
+    setPhase("ice");
+    showToast("Still waiting for the other side. Retrying...", 2500);
+    scanRoomPeers(token);
+    if (meshScanTimer) return;
+    meshScanTimer = setInterval(() => {
+      if (!peer || !peer.open || peers.size > 0 || !currentToken) {
+        clearMeshScanTimer();
+        return;
+      }
+      scanRoomPeers(currentToken);
+    }, MESH_SCAN_INTERVAL);
+  }
+
+  function scanRoomPeers(token) {
+    if (!peer || !peer.open || !currentPeerId) return;
+    const hostId = `isay-${token}-host`;
+    initiateCall(hostId, { maxAttempts: 1 });
+    for (let i = 0; i < MAX_PEERS; i++) {
+      const guestId = `isay-${token}-g${i}`;
+      if (guestId !== currentPeerId) initiateCall(guestId, { maxAttempts: 1 });
+    }
   }
 
   // ========== PeerJS connection ==========
@@ -1054,6 +1090,7 @@
   async function connectPeer(token) {
     currentToken = token;
     currentRole = null;
+    currentPeerId = null;
 
     try {
       await getLocalStream();
@@ -1079,6 +1116,7 @@
 
       p.on("open", () => {
         currentRole = "host";
+        currentPeerId = hostId;
         peer = p;
         setPhase("ice");
         clearTimeout(timeout);
@@ -1106,6 +1144,7 @@
 
             gp.on("open", () => {
               currentRole = "guest";
+              currentPeerId = guestId;
               peer = gp;
               setPhase("ice");
               clearTimeout(timeout);
@@ -1231,6 +1270,7 @@
 
   function endCall(reason) {
     clearReconnectTimer();
+    clearMeshScanTimer();
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
@@ -1239,6 +1279,7 @@
     closeAllPeers();
     stopLocalStream();
     destroyPeer();
+    currentPeerId = null;
     // Reset audio session
     if ("audioSession" in navigator) {
       try { navigator.audioSession.type = "auto"; } catch (_) {}
@@ -1255,6 +1296,7 @@
   }
 
   function destroyPeer() {
+    currentPeerId = null;
     clearAllPendingCalls();
     if (peer) {
       try { peer.destroy(); } catch (_) {}
@@ -1268,10 +1310,12 @@
     stopAudioViz();
     stopStatsMonitor();
     clearReconnectTimer();
+    clearMeshScanTimer();
     releaseWakeLock();
     reconnectAttempts = 0;
     currentToken = null;
     currentRole = null;
+    currentPeerId = null;
     isMuted = false;
     speakerOn = true;
     currentAudioOutput = "default";
