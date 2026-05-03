@@ -20,6 +20,9 @@
   let wakeLock = null;
   let lastQualityScore = -1;
   let bitrateAppliedOnce = false;
+  let currentAudioOutput = "default";
+  let speakerOn = true;
+  let lastIceRestart = 0;
 
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
@@ -103,13 +106,15 @@
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
-      sampleRate: 48000,
-      channelCount: 1,
+      sampleRate: { ideal: 48000 },
+      channelCount: { ideal: 1 },
       googEchoCancellation: true,
       googAutoGainControl: true,
       googNoiseSuppression: true,
       googHighpassFilter: true,
       googTypingNoiseDetection: true,
+      mozAutoGainControl: true,
+      mozNoiseSuppression: true,
     },
     video: false,
   };
@@ -117,33 +122,16 @@
   // --- ICE config (optimized for 5G + WiFi + restrictive NAT) ---
   const ICE_CONFIG = {
     iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" },
-      { urls: "stun:stun3.l.google.com:19302" },
-      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302", "stun:stun3.l.google.com:19302", "stun:stun4.l.google.com:19302"] },
       { urls: "stun:global.stun.twilio.com:3478" },
-      // TURN: all transport combos for maximum reachability
+      { urls: "stun:stun.nextcloud.com:443" },
       {
-        urls: [
-          "turn:openrelay.metered.ca:80",
-          "turn:openrelay.metered.ca:443",
-          "turn:openrelay.metered.ca:443?transport=tcp",
-        ],
+        urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:443?transport=tcp", "turn:openrelay.metered.ca:443?transport=udp"],
         username: "openrelayproject",
         credential: "openrelayproject",
       },
       {
-        urls: [
-          "turns:openrelay.metered.ca:443",
-          "turns:openrelay.metered.ca:443?transport=tcp",
-        ],
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
-      // Additional TURN endpoints for redundancy
-      {
-        urls: "turn:openrelay.metered.ca:443?transport=udp",
+        urls: ["turns:openrelay.metered.ca:443"],
         username: "openrelayproject",
         credential: "openrelayproject",
       },
@@ -151,7 +139,7 @@
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 4, // Increased from 2 for faster 5G candidate gathering
+    iceCandidatePoolSize: 4,
   };
 
   // --- DOM ---
@@ -172,12 +160,18 @@
   async function getLocalStream() {
     if (localStream) return localStream;
     localStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+    localStream.getAudioTracks().forEach((track) => {
+      track.onended = () => {
+        showToast("Microphone disconnected.");
+        if (peers.size > 0) endCall("Microphone disconnected.");
+      };
+    });
     return localStream;
   }
 
   function stopLocalStream() {
     if (localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
+      localStream.getTracks().forEach((t) => { t.onended = null; t.stop(); });
       localStream = null;
     }
   }
@@ -187,28 +181,33 @@
     const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
     if (!opusMatch) return sdp;
     const opusPT = opusMatch[1];
-    // maxaveragebitrate=48000: fullband quality
-    // useinbandfec: packet loss resilience
-    // NO minptime override (let browser default to 20ms, lower latency)
-    // NO maxplaybackrate (unrestricted, lower processing delay)
-    const fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0`;
+    // useinbandfec=1: packet loss resilience via FEC
+    // maxaveragebitrate=48000: fullband quality (~48kbps average)
+    // usedtx=1: silence suppression (DTX) to save bandwidth
+    // cbr=0: variable bitrate for best quality at target bitrate
+    // stereo=0; sprop-stereo=0: mono for lower latency and bandwidth
+    // maxplaybackrate=48000; sprop-maxcapturerate=48000: fullband 48kHz
+    const fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
     const lines = sdp.split("\r\n");
     let replaced = false;
+    let lastOpusIdx = -1;
     for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith(`a=rtpmap:${opusPT}`) || lines[i].startsWith(`a=fmtp:${opusPT}`)) {
+        lastOpusIdx = i;
+      }
       if (lines[i].startsWith(`a=fmtp:${opusPT}`)) {
         lines[i] = fmtpLine;
         replaced = true;
-        break;
       }
     }
-    if (!replaced) {
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith(`a=rtpmap:${opusPT}`)) {
-          lines.splice(i + 1, 0, fmtpLine);
-          break;
-        }
-      }
+    if (!replaced && lastOpusIdx >= 0) {
+      lines.splice(lastOpusIdx + 1, 0, fmtpLine);
     }
+    // Add ptime/maxptime for consistent packetization (20ms optimal for voice)
+    const hasPtime = lines.some(l => l === "a=ptime:20");
+    const hasMaxptime = lines.some(l => l === "a=maxptime:60");
+    if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
+    if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
     return lines.join("\r\n");
   }
 
@@ -250,6 +249,10 @@
       } else {
         targetBitrate = 64000; // Higher ceiling for good networks
       }
+      // In mesh, cap send bitrate as peer count grows to protect uplink
+      const peerCount = peers.size + 1;
+      if (peerCount > 4) targetBitrate = Math.min(targetBitrate, 32000);
+      if (peerCount > 6) targetBitrate = Math.min(targetBitrate, 24000);
       params.encodings[0].maxBitrate = targetBitrate;
       params.encodings[0].priority = "high";
       await sender.setParameters(params);
@@ -284,6 +287,62 @@
     });
   }
 
+  // ========== Audio session & routing ==========
+  function configureAudioSession() {
+    if ("audioSession" in navigator) {
+      try {
+        navigator.audioSession.type = speakerOn ? "play-and-record" : "voice-chat";
+      } catch (_) {}
+    }
+  }
+
+  async function toggleSpeaker() {
+    speakerOn = !speakerOn;
+    const btn = $("#btn-speaker");
+    const iconOn = $("#icon-speaker");
+    const iconOff = $("#icon-earpiece");
+    const label = $("#speaker-label");
+    if (btn) btn.classList.toggle("speaker-off", !speakerOn);
+    if (iconOn) iconOn.style.display = speakerOn ? "" : "none";
+    if (iconOff) iconOff.style.display = speakerOn ? "none" : "";
+    if (label) label.textContent = speakerOn ? "Speaker" : "Earpiece";
+    haptic(speakerOn ? [20, 10, 20] : 30);
+
+    // iOS: use audioSession API
+    configureAudioSession();
+
+    // Adjust remote audio volumes to reduce echo in speakerphone mode
+    for (const [, info] of peers) {
+      if (info.remoteAudio) info.remoteAudio.volume = speakerOn ? 0.85 : 1.0;
+    }
+
+    // Desktop/Android: use setSinkId if available
+    if ("setSinkId" in Audio.prototype) {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const outputs = devices.filter(d => d.kind === "audiooutput");
+        let targetId = "default";
+        if (!speakerOn) {
+          const comm = outputs.find(d => /earpiece|communication/i.test(d.label));
+          if (comm) targetId = comm.deviceId;
+        } else {
+          const speaker = outputs.find(d => /speaker/i.test(d.label) && !/earpiece/i.test(d.label));
+          if (speaker) targetId = speaker.deviceId;
+        }
+        currentAudioOutput = targetId;
+        for (const [, info] of peers) {
+          if (info.remoteAudio && info.remoteAudio.setSinkId) {
+            await info.remoteAudio.setSinkId(targetId);
+          }
+        }
+      } catch (e) {
+        showToast("Audio routing not available on this device.");
+      }
+    } else {
+      showToast(speakerOn ? "Speaker mode" : "Earpiece mode", 1500);
+    }
+  }
+
   // ========== Peer count UI ==========
   function updatePeerCount() {
     const count = peers.size + 1; // +1 for self
@@ -304,7 +363,13 @@
     const remoteAudio = new Audio();
     remoteAudio.srcObject = stream;
     remoteAudio.autoplay = true;
+    remoteAudio.playsInline = true;
+    remoteAudio.setAttribute("playsinline", "");
+    remoteAudio.volume = speakerOn ? 0.85 : 1.0; // Reduce echo in speakerphone mode
     remoteAudio.play().catch(() => {});
+    if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
+      remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
+    }
 
     let analyser = null;
     if (audioCtx) {
@@ -330,6 +395,7 @@
       startDurationTimer();
       requestWakeLock();
       showScreen("call");
+      configureAudioSession();
     }
   }
 
@@ -433,16 +499,18 @@
   }
 
   // ========== Speaking detection ==========
+  let rmsBuffer = new Uint8Array(256);
   function getRMS(analyser) {
     if (!analyser) return 0;
-    const data = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(data);
+    const size = analyser.fftSize;
+    if (rmsBuffer.length < size) rmsBuffer = new Uint8Array(size);
+    analyser.getByteTimeDomainData(rmsBuffer);
     let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      const v = (data[i] - 128) / 128;
+    for (let i = 0; i < size; i++) {
+      const v = (rmsBuffer[i] - 128) / 128;
       sum += v * v;
     }
-    return Math.sqrt(sum / data.length);
+    return Math.sqrt(sum / size);
   }
 
   function updateSpeakingIndicators() {
@@ -475,6 +543,7 @@
     drawVisualizer();
     setupCanvasResize();
     logAudioLatency();
+    configureAudioSession();
   }
 
   let resizeTimer = null;
@@ -498,6 +567,13 @@
     if (total > 0) showToast(`Audio latency: ${total}ms`, 2500);
   }
 
+  // Reusable buffers to reduce GC pressure during visualization
+  const vizBuffers = {
+    local: null,
+    remote: null,
+    peerTmp: new Map(), // peerId -> Uint8Array
+  };
+
   function drawVisualizer() {
     const canvas = $("#visualizer");
     if (!canvas) return;
@@ -514,10 +590,10 @@
     const logicalW = rect.width;
     const logicalH = rect.height;
     const bufLen = localAnalyser ? localAnalyser.frequencyBinCount : 128;
-    const localData = new Uint8Array(bufLen);
-
-    // Collect remote data from all peers (merged)
-    const remoteMerged = new Uint8Array(bufLen);
+    if (!vizBuffers.local || vizBuffers.local.length !== bufLen) vizBuffers.local = new Uint8Array(bufLen);
+    if (!vizBuffers.remote || vizBuffers.remote.length !== bufLen) vizBuffers.remote = new Uint8Array(bufLen);
+    const localData = vizBuffers.local;
+    const remoteMerged = vizBuffers.remote;
 
     function draw() {
       vizRAF = requestAnimationFrame(draw);
@@ -528,15 +604,23 @@
       // Merge all remote peer frequency data
       remoteMerged.fill(0);
       let remoteCount = 0;
-      for (const [, info] of peers) {
+      for (const [pid, info] of peers) {
         if (info.analyser) {
-          const tmp = new Uint8Array(bufLen);
+          let tmp = vizBuffers.peerTmp.get(pid);
+          if (!tmp || tmp.length !== bufLen) {
+            tmp = new Uint8Array(bufLen);
+            vizBuffers.peerTmp.set(pid, tmp);
+          }
           info.analyser.getByteFrequencyData(tmp);
           for (let i = 0; i < bufLen; i++) {
-            remoteMerged[i] = Math.max(remoteMerged[i], tmp[i]);
+            if (tmp[i] > remoteMerged[i]) remoteMerged[i] = tmp[i];
           }
           remoteCount++;
         }
+      }
+      // Clean up buffers for disconnected peers
+      for (const pid of vizBuffers.peerTmp.keys()) {
+        if (!peers.has(pid)) vizBuffers.peerTmp.delete(pid);
       }
 
       const barCount = 40;
@@ -586,6 +670,9 @@
     localAnalyser = null;
     clearTimeout(resizeTimer);
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+    vizBuffers.local = null;
+    vizBuffers.remote = null;
+    vizBuffers.peerTmp.clear();
   }
 
   // ========== Connection quality monitoring ==========
@@ -638,6 +725,7 @@
   }
 
   let statsPaused = false;
+  let glitchStats = { lastTs: 0 };
   function startStatsMonitor(pc) {
     prevStats = null;
     let consecBad = 0;
@@ -655,6 +743,7 @@
         if (currentPair) {
           const latency = currentPair.currentRoundTripTime ? currentPair.currentRoundTripTime * 1000 : -1;
           let loss = -1, jitter = -1;
+          let recvBitrate = -1;
           stats.forEach((report) => {
             if (report.type === "inbound-rtp" && report.kind === "audio") {
               if (prevStats && prevStats[report.id]) {
@@ -663,13 +752,35 @@
                 const dLost = (report.packetsLost || 0) - (prev.packetsLost || 0);
                 const total = dRecv + dLost;
                 if (total > 0) loss = (dLost / total) * 100;
+                // Bitrate estimation
+                const dBytes = (report.bytesReceived || 0) - (prev.bytesReceived || 0);
+                recvBitrate = Math.round((dBytes * 8) / 2); // kbps over 2s interval
+                // Glitch detection: concealed samples indicate packet loss concealment
+                const dConcealed = (report.concealedSamples || 0) - (prev.concealedSamples || 0);
+                const dTotalSamples = (report.totalSamplesReceived || 0) - (prev.totalSamplesReceived || 0);
+                if (dTotalSamples > 0 && dConcealed > 0) {
+                  const glitchRate = dConcealed / dTotalSamples;
+                  if (glitchRate > 0.03) {
+                    const now = Date.now();
+                    if (now - glitchStats.lastTs > 8000) {
+                      glitchStats.lastTs = now;
+                      showToast(`Audio stutter: ${(glitchRate * 100).toFixed(0)}% concealed`, 2500);
+                    }
+                  }
+                }
               } else {
                 const total = report.packetsReceived + (report.packetsLost || 0);
                 if (total > 0) loss = ((report.packetsLost || 0) / total) * 100;
               }
               if (report.jitter !== undefined) jitter = report.jitter * 1000;
               if (!prevStats) prevStats = {};
-              prevStats[report.id] = { packetsReceived: report.packetsReceived, packetsLost: report.packetsLost || 0 };
+              prevStats[report.id] = {
+                packetsReceived: report.packetsReceived,
+                packetsLost: report.packetsLost || 0,
+                bytesReceived: report.bytesReceived || 0,
+                concealedSamples: report.concealedSamples || 0,
+                totalSamplesReceived: report.totalSamplesReceived || 0,
+              };
             }
           });
           updateMetrics(latency, jitter, loss);
@@ -677,10 +788,13 @@
           const rtt = currentPair.currentRoundTripTime || 0;
           adaptAudioBitrate(pc, loss, jitter, rtt);
           configureJitterBuffer(pc, jitter);
-          if (loss > 15 || latency > 500) {
+          // Preemptive ICE restart: act on trend, not just threshold
+          if (loss > 12 || latency > 400) {
             consecBad++;
-            if (consecBad >= 3) { attemptICERestart(pc); consecBad = 0; }
-          } else { consecBad = 0; }
+            if (consecBad >= 2) { attemptICERestart(pc); consecBad = 0; }
+          } else if (loss < 5 && latency < 200) {
+            consecBad = Math.max(0, consecBad - 1);
+          }
         }
       }).catch(() => {});
     }, 2000);
@@ -697,6 +811,9 @@
   function attemptICERestart(pc) {
     const target = pc || (peers.values().next().value?.call?.peerConnection);
     if (!target) return;
+    const now = Date.now();
+    if (now - lastIceRestart < 10000) return;
+    lastIceRestart = now;
     try { target.restartIce(); } catch (_) {}
   }
 
@@ -955,6 +1072,10 @@
     closeAllPeers();
     stopLocalStream();
     destroyPeer();
+    // Reset audio session
+    if ("audioSession" in navigator) {
+      try { navigator.audioSession.type = "auto"; } catch (_) {}
+    }
     $("#disconnect-reason").textContent = reason || "The call has ended";
     const titleEl = $("#disconnect-title");
     if (titleEl) {
@@ -984,11 +1105,21 @@
     currentToken = null;
     currentRole = null;
     isMuted = false;
+    speakerOn = true;
+    currentAudioOutput = "default";
     $("#token-input").value = generateToken();
     $("#btn-mute").classList.remove("muted");
     $("#icon-mic-on").style.display = "";
     $("#icon-mic-off").style.display = "none";
     $("#mute-label").textContent = "Mute";
+    const spkBtn = $("#btn-speaker");
+    if (spkBtn) spkBtn.classList.remove("speaker-off");
+    const iconSpk = $("#icon-speaker");
+    const iconEar = $("#icon-earpiece");
+    if (iconSpk) iconSpk.style.display = "";
+    if (iconEar) iconEar.style.display = "none";
+    const spkLabel = $("#speaker-label");
+    if (spkLabel) spkLabel.textContent = "Speaker";
     showScreen("landing");
   }
 
@@ -1011,6 +1142,8 @@
   $("#btn-copy-link").addEventListener("click", copyShareLink);
   $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing"); });
   $("#btn-mute").addEventListener("click", toggleMute);
+  const speakerBtn = $("#btn-speaker");
+  if (speakerBtn) speakerBtn.addEventListener("click", toggleSpeaker);
   $("#btn-hangup").addEventListener("click", () => endCall("You ended the call"));
   $("#btn-restart").addEventListener("click", restart);
   $("#btn-retry").addEventListener("click", () => { if (currentToken) joinRoom(currentToken); else restart(); });

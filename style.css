@@ -498,6 +498,12 @@ button:active {
   border-color: var(--danger);
 }
 
+.btn-control.speaker-off {
+  background: var(--warning);
+  border-color: var(--warning);
+  color: #000;
+}
+
 .btn-danger {
   background: var(--danger) !important;
   border-color: var(--danger) !important;
@@ -632,7 +638,7 @@ button:focus-visible {
   h1 { font-size: 2.2rem; }
   .input-group { flex-direction: column; }
   .controls { gap: 12px; }
-  .btn-control { min-width: 80px; padding: 14px 16px; }
+  .btn-control { min-width: 72px; padding: 14px 12px; }
   .conn-bar { flex-direction: column; align-items: stretch; text-align: center; }
   .conn-metrics { justify-content: center; }
   .qr-section img { width: 120px; height: 120px; }
