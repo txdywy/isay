@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  // --- State ---
+  // ========== State ==========
   let peer = null;
   let currentCall = null;
   let localStream = null;
@@ -19,12 +19,88 @@
   let currentToken = null;
   let currentRole = null;
   let iceRestarted = false;
+  let wakeLock = null;
+  let lastQualityScore = -1;
 
   const MAX_RECONNECT_ATTEMPTS = 3;
-  const ICE_RECONNECT_WAIT = 4000; // wait before attempting ICE restart
+  const ICE_RECONNECT_WAIT = 4000;
   const RECONNECT_BACKOFF = [2000, 4000, 8000];
 
-  // --- Audio constraints: optimized for voice ---
+  // ========== Word list for auto-token ==========
+  const ADJECTIVES = [
+    "brave","calm","dark","eager","fair","glad","happy","jolly","keen","lively",
+    "merry","noble","proud","quick","rapid","sharp","swift","vivid","warm","wise",
+    "azure","coral","frost","golden","ivory","lunar","maple","ocean","pearl","solar",
+    "amber","blaze","cedar","delta","ember","flint","grove","hazel","indigo","jade",
+  ];
+  const NOUNS = [
+    "wolf","bear","fox","hawk","eagle","lion","tiger","panda","otter","dove",
+    "star","moon","sun","wave","wind","rain","snow","fire","leaf","rock",
+    "peak","vale","bay","isle","reef","glen","dune","mist","bolt","crest",
+    "fern","kite","lynx","moth","opus","quill","rune","sage","tide","vibe",
+  ];
+
+  function generateToken() {
+    const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+    const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+    const num = Math.floor(Math.random() * 100);
+    return `${adj}-${noun}-${num}`;
+  }
+
+  // ========== Wake Lock ==========
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    } catch (_) {}
+  }
+
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  }
+
+  // ========== Toast notifications ==========
+  function showToast(message, duration = 3000) {
+    let container = $("#toast-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "toast-container";
+      document.body.appendChild(container);
+    }
+    const toast = document.createElement("div");
+    toast.className = "toast";
+    toast.textContent = message;
+    container.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add("show"));
+    setTimeout(() => {
+      toast.classList.remove("show");
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
+
+  // ========== Screen reader announcer ==========
+  function announce(text) {
+    const el = $("#sr-announcer");
+    if (el) el.textContent = text;
+  }
+
+  // ========== Browser compatibility check ==========
+  function checkCompatibility() {
+    const issues = [];
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+      issues.push("getUserMedia");
+    }
+    if (!(window.RTCPeerConnection || window.webkitRTCPeerConnection)) {
+      issues.push("RTCPeerConnection");
+    }
+    if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+      issues.push("https");
+    }
+    return issues;
+  }
+
+  // --- Audio constraints ---
   const AUDIO_CONSTRAINTS = {
     audio: {
       echoCancellation: true,
@@ -32,7 +108,6 @@
       autoGainControl: true,
       sampleRate: 48000,
       channelCount: 1,
-      // Advanced Chrome-only hints
       googEchoCancellation: true,
       googAutoGainControl: true,
       googNoiseSuppression: true,
@@ -42,15 +117,13 @@
     video: false,
   };
 
-  // --- ICE config: optimized for speed + reachability ---
+  // --- ICE config ---
   const ICE_CONFIG = {
     iceServers: [
-      // Multiple STUN for faster candidate gathering
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
       { urls: "stun:stun2.l.google.com:19302" },
       { urls: "stun:global.stun.twilio.com:3478" },
-      // TURN: UDP primary, TCP fallback for restrictive NAT
       {
         urls: [
           "turn:openrelay.metered.ca:80",
@@ -103,16 +176,12 @@
     }
   }
 
-  // --- SDP optimization: tune Opus for voice ---
+  // --- SDP optimization ---
   function optimizeSDP(sdp) {
-    // Find Opus payload type
     const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
     if (!opusMatch) return sdp;
     const opusPT = opusMatch[1];
-
-    // Add/replace fmtp line with optimized parameters
-    const fmtpLine = `a=fmtp:${opusPT} minptime=10;useinbandfec=1;maxaveragebitrate=32000;stereo=0;cbr=0;sprop-stereo=0`;
-
+    const fmtpLine = `a=fmtp:${opusPT} minptime=10;useinbandfec=1;maxaveragebitrate=32000;stereo=0;cbr=0;sprop-stereo=0;maxplaybackrate=16000`;
     const lines = sdp.split("\r\n");
     let replaced = false;
     for (let i = 0; i < lines.length; i++) {
@@ -123,7 +192,6 @@
       }
     }
     if (!replaced) {
-      // Insert after rtpmap line
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith(`a=rtpmap:${opusPT}`)) {
           lines.splice(i + 1, 0, fmtpLine);
@@ -137,31 +205,75 @@
   function applySDPOptimization(call) {
     const pc = call.peerConnection;
     if (!pc) return;
-
-    // Intercept SDP for offer
     const origCreateOffer = pc.createOffer.bind(pc);
     pc.createOffer = async function (...args) {
       const offer = await origCreateOffer(...args);
       offer.sdp = optimizeSDP(offer.sdp);
       return offer;
     };
-
-    // Intercept SDP for answer
     const origCreateAnswer = pc.createAnswer.bind(pc);
     pc.createAnswer = async function (...args) {
       const answer = await origCreateAnswer(...args);
       answer.sdp = optimizeSDP(answer.sdp);
       return answer;
     };
-
-    // Also optimize any pending remote description
     const origSetRemote = pc.setRemoteDescription.bind(pc);
     pc.setRemoteDescription = async function (desc) {
-      if (desc && desc.sdp) {
-        desc.sdp = optimizeSDP(desc.sdp);
-      }
+      if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
       return origSetRemote(desc);
     };
+  }
+
+  // --- Adaptive bitrate ---
+  async function adaptAudioBitrate(pc, loss, jitter, rtt) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) {
+        params.encodings = [{}];
+      }
+      let targetBitrate;
+      if (loss > 10 || jitter > 100 || rtt > 0.5) {
+        targetBitrate = 12000; // Poor: narrowband
+      } else if (loss > 3 || jitter > 50 || rtt > 0.3) {
+        targetBitrate = 24000; // Moderate: super-wideband
+      } else {
+        targetBitrate = 48000; // Good: fullband
+      }
+      params.encodings[0].maxBitrate = targetBitrate;
+      params.encodings[0].priority = "high";
+      await sender.setParameters(params);
+    } catch (_) {}
+  }
+
+  // --- Jitter buffer tuning ---
+  function configureJitterBuffer(pc, jitter) {
+    try {
+      const receivers = pc.getReceivers();
+      receivers.forEach((receiver) => {
+        if (receiver.track.kind === "audio" && "jitterBufferTarget" in receiver) {
+          // Adaptive: more jitter = bigger buffer
+          if (jitter < 20) receiver.jitterBufferTarget = 20;
+          else if (jitter < 50) receiver.jitterBufferTarget = 40;
+          else receiver.jitterBufferTarget = 80;
+        }
+      });
+    } catch (_) {}
+  }
+
+  // --- Network migration detection ---
+  function setupNetworkMigration(pc) {
+    if (!navigator.connection) return;
+    let lastType = navigator.connection.effectiveType;
+    navigator.connection.addEventListener("change", () => {
+      const newType = navigator.connection.effectiveType;
+      if (newType !== lastType) {
+        lastType = newType;
+        showToast(`Network changed to ${newType}. Adjusting...`);
+        try { pc.restartIce(); } catch (_) {}
+      }
+    });
   }
 
   // --- Duration ---
@@ -192,24 +304,92 @@
       el.classList.toggle("done", pi < idx);
       el.classList.toggle("active", pi === idx);
     });
-
-    const lines = document.querySelectorAll(".phase-line");
-    lines.forEach((line, i) => {
+    document.querySelectorAll(".phase-line").forEach((line, i) => {
       line.classList.toggle("done", i < idx);
       line.classList.toggle("active", i === idx);
     });
-
     const lbl = $("#phase-label");
     if (lbl) lbl.textContent = label[name] || "";
+    announce(label[name] || "");
+  }
+
+  // ========== QR Code (minimal inline) ==========
+  // Lightweight QR generator - only what we need for a URL
+  function generateQR(text, canvas, size) {
+    // Use a simple approach: encode text into a data URL via an off-screen approach
+    // For simplicity, use a tiny QR library loaded on demand
+    const ctx = canvas.getContext("2d");
+    canvas.width = size;
+    canvas.height = size;
+
+    // Simple binary encoding as placeholder - real QR needs a library
+    // We'll use a different approach: load qr code library dynamically
+    if (!generateQR._loaded) {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js";
+      script.onload = () => {
+        generateQR._loaded = true;
+        generateQR(text, canvas, size);
+      };
+      script.onerror = () => {
+        // Fallback: show text
+        ctx.fillStyle = "#1a1a1a";
+        ctx.fillRect(0, 0, size, size);
+        ctx.fillStyle = "#888";
+        ctx.font = "12px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("QR not available", size / 2, size / 2);
+      };
+      document.head.appendChild(script);
+      return;
+    }
+
+    if (typeof QRCode !== "undefined") {
+      QRCode.toCanvas(canvas, text, {
+        width: size,
+        margin: 2,
+        color: { dark: "#4f9cf7", light: "#1a1a1a" },
+      }, (err) => {
+        if (err) {
+          ctx.fillStyle = "#1a1a1a";
+          ctx.fillRect(0, 0, size, size);
+          ctx.fillStyle = "#888";
+          ctx.font = "12px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText("QR error", size / 2, size / 2);
+        }
+      });
+    }
+  }
+
+  // ========== Speaking detection ==========
+  function getRMS(analyser) {
+    if (!analyser) return 0;
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / data.length);
+  }
+
+  function updateSpeakingIndicators() {
+    const localRMS = getRMS(localAnalyser);
+    const remoteRMS = getRMS(remoteAnalyser);
+
+    const localLabel = $("#label-local");
+    const remoteLabel = $("#label-remote");
+    if (localLabel) localLabel.classList.toggle("speaking", localRMS > 0.05 && !isMuted);
+    if (remoteLabel) remoteLabel.classList.toggle("speaking", remoteRMS > 0.05);
   }
 
   // ========== Audio Visualizer ==========
   function initAudioViz(remoteStream) {
     try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    } catch (_) {
-      return;
-    }
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+    } catch (_) { return; }
 
     const localSrc = audioCtx.createMediaStreamSource(localStream);
     localAnalyser = audioCtx.createAnalyser();
@@ -251,6 +431,7 @@
 
       drawBars(ctx, remoteData, barCount, barW, step, W, H, "#22c55e", 0.7, true);
       drawBars(ctx, localData, barCount, barW, step, W, H, "#4f9cf7", 0.8, false);
+      updateSpeakingIndicators();
     }
 
     draw();
@@ -259,22 +440,15 @@
   function drawBars(ctx, data, count, barW, step, W, H, color, alpha, fromBottom) {
     const halfH = H / 2;
     const centerY = fromBottom ? H : 0;
-
     for (let i = 0; i < count; i++) {
       const val = data[i * step] / 255;
       const barH = Math.max(2, val * halfH * 0.9);
-
       ctx.fillStyle = color;
       ctx.globalAlpha = alpha * (0.3 + val * 0.7);
-
       const x = i * (barW + 2);
       const radius = Math.min(barW / 2, 3);
-
-      if (fromBottom) {
-        roundRect(ctx, x, centerY - barH, barW, barH, radius);
-      } else {
-        roundRect(ctx, x, centerY, barW, barH, radius);
-      }
+      if (fromBottom) roundRect(ctx, x, centerY - barH, barW, barH, radius);
+      else roundRect(ctx, x, centerY, barW, barH, radius);
     }
     ctx.globalAlpha = 1;
   }
@@ -298,10 +472,7 @@
     vizRAF = null;
     localAnalyser = null;
     remoteAnalyser = null;
-    if (audioCtx) {
-      audioCtx.close().catch(() => {});
-      audioCtx = null;
-    }
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   }
 
   // ========== Connection quality monitoring ==========
@@ -310,7 +481,6 @@
     const icon = $("#conn-icon");
     const text = $("#conn-type-text");
     badge.className = "conn-badge " + type;
-
     const map = {
       checking: { icon: "...", text: "Connecting" },
       p2p: { icon: "P", text: "Direct P2P" },
@@ -327,6 +497,14 @@
     const el = $("#quality-segments");
     el.setAttribute("data-quality", level);
     $("#quality-label").textContent = label;
+
+    // Toast on quality transitions
+    if (lastQualityScore >= 4 && level <= 2 && level > 0) {
+      showToast("Connection quality degraded. Audio may be interrupted.");
+    } else if (lastQualityScore <= 2 && level >= 4) {
+      showToast("Connection quality restored.");
+    }
+    if (level > 0) lastQualityScore = level;
   }
 
   function updateMetrics(latency, jitter, loss) {
@@ -359,68 +537,44 @@
     prevStats = null;
     let consecBad = 0;
     statsInterval = setInterval(() => {
-      if (!pc || pc.connectionState === "closed") {
-        stopStatsMonitor();
-        return;
-      }
+      if (!pc || pc.connectionState === "closed") { stopStatsMonitor(); return; }
       pc.getStats().then((stats) => {
         let isRelay = false;
         let currentPair = null;
-
         stats.forEach((report) => {
-          if (report.type === "candidate-pair" && report.state === "succeeded") {
-            currentPair = report;
-          }
-          if (report.type === "local-candidate" && report.candidateType === "relay") {
-            isRelay = true;
-          }
+          if (report.type === "candidate-pair" && report.state === "succeeded") currentPair = report;
+          if (report.type === "local-candidate" && report.candidateType === "relay") isRelay = true;
         });
-
         if (currentPair) {
           const latency = currentPair.currentRoundTripTime ? currentPair.currentRoundTripTime * 1000 : -1;
-          let loss = -1;
-          let jitter = -1;
-
+          let loss = -1, jitter = -1;
           stats.forEach((report) => {
             if (report.type === "inbound-rtp" && report.kind === "audio") {
-              // Use delta packet loss for real-time accuracy
               if (prevStats && prevStats[report.id]) {
                 const prev = prevStats[report.id];
                 const dRecv = report.packetsReceived - prev.packetsReceived;
                 const dLost = (report.packetsLost || 0) - (prev.packetsLost || 0);
                 const total = dRecv + dLost;
-                if (total > 0) {
-                  loss = (dLost / total) * 100;
-                }
+                if (total > 0) loss = (dLost / total) * 100;
               } else {
                 const total = report.packetsReceived + (report.packetsLost || 0);
-                if (total > 0) {
-                  loss = ((report.packetsLost || 0) / total) * 100;
-                }
+                if (total > 0) loss = ((report.packetsLost || 0) / total) * 100;
               }
-              if (report.jitter !== undefined) {
-                jitter = report.jitter * 1000;
-              }
-
-              // Save for next delta
+              if (report.jitter !== undefined) jitter = report.jitter * 1000;
               if (!prevStats) prevStats = {};
-              prevStats[report.id] = {
-                packetsReceived: report.packetsReceived,
-                packetsLost: report.packetsLost || 0,
-              };
+              prevStats[report.id] = { packetsReceived: report.packetsReceived, packetsLost: report.packetsLost || 0 };
             }
           });
-
           updateMetrics(latency, jitter, loss);
           setConnType(isRelay ? "relay" : "p2p");
 
-          // Track consecutive bad quality for proactive recovery
+          // Adaptive bitrate + jitter buffer tuning
+          const rtt = currentPair.currentRoundTripTime || 0;
+          adaptAudioBitrate(pc, loss, jitter, rtt);
+          configureJitterBuffer(pc, jitter);
           if (loss > 15 || latency > 500) {
             consecBad++;
-            if (consecBad >= 3 && currentCall) {
-              attemptICERestart();
-              consecBad = 0;
-            }
+            if (consecBad >= 3 && currentCall) { attemptICERestart(); consecBad = 0; }
           } else {
             consecBad = 0;
           }
@@ -433,6 +587,7 @@
     clearInterval(statsInterval);
     statsInterval = null;
     prevStats = null;
+    lastQualityScore = -1;
   }
 
   // ========== ICE restart & reconnection ==========
@@ -440,9 +595,7 @@
     if (!currentCall || !currentCall.peerConnection) return;
     const pc = currentCall.peerConnection;
     if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-      try {
-        pc.restartIce();
-      } catch (_) {}
+      try { pc.restartIce(); } catch (_) {}
     }
   }
 
@@ -451,36 +604,26 @@
       endCall("Connection lost. Max reconnection attempts reached.");
       return;
     }
-
     const delay = RECONNECT_BACKOFF[Math.min(reconnectAttempts, RECONNECT_BACKOFF.length - 1)];
     setConnType("disconnected");
     updateMetrics(-1, -1, -1);
     setQuality(0, "Reconnecting...");
     const lbl = $("#phase-label");
     if (lbl) lbl.textContent = `Reconnecting in ${Math.ceil(delay / 1000)}s (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`;
+    announce("Connection lost. Reconnecting.");
 
     clearReconnectTimer();
     reconnectTimer = setTimeout(async () => {
       reconnectAttempts++;
-      if (!currentToken) {
-        endCall("Connection lost.");
-        return;
-      }
-
-      // Clean up old connection
+      if (!currentToken) { endCall("Connection lost."); return; }
       if (currentCall) {
         currentCall.close();
-        if (currentCall._remoteAudio) {
-          currentCall._remoteAudio.pause();
-          currentCall._remoteAudio.srcObject = null;
-        }
+        if (currentCall._remoteAudio) { currentCall._remoteAudio.pause(); currentCall._remoteAudio.srcObject = null; }
         currentCall = null;
       }
       stopAudioViz();
       stopStatsMonitor();
       destroyPeer();
-
-      // Reconnect
       showScreen("waiting");
       setPhase("signaling");
       try {
@@ -493,57 +636,39 @@
   }
 
   function clearReconnectTimer() {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   }
 
   // ========== Peer connection monitoring ==========
   function monitorPeerConnection(call) {
     const pc = call.peerConnection;
     if (!pc) return;
-
     iceRestarted = false;
+    setupNetworkMigration(pc);
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
       switch (state) {
-        case "checking":
-          setConnType("checking");
-          break;
+        case "checking": setConnType("checking"); break;
         case "connected":
         case "completed":
           reconnectAttempts = 0;
           iceRestarted = false;
           startStatsMonitor(pc);
+          announce("Connected. Call active.");
           break;
         case "disconnected":
-          // Try ICE restart first before full reconnect
           if (!iceRestarted) {
             iceRestarted = true;
             setConnType("disconnected");
-            setTimeout(() => {
-              if (pc.iceConnectionState === "disconnected") {
-                attemptICERestart();
-              }
-            }, ICE_RECONNECT_WAIT);
-          } else {
-            scheduleReconnect();
-          }
+            setTimeout(() => { if (pc.iceConnectionState === "disconnected") attemptICERestart(); }, ICE_RECONNECT_WAIT);
+          } else { scheduleReconnect(); }
           break;
-        case "failed":
-          scheduleReconnect();
-          break;
+        case "failed": scheduleReconnect(); break;
       }
     };
-
-    // Also monitor connectionState for better coverage
     pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      if (state === "failed") {
-        scheduleReconnect();
-      }
+      if (pc.connectionState === "failed") scheduleReconnect();
     };
   }
 
@@ -552,43 +677,28 @@
     currentCall = call;
     clearCallTimeout();
     setPhase("connected");
-
-    // Apply SDP optimization for Opus codec
     applySDPOptimization(call);
 
     call.on("stream", (remoteStream) => {
       const audio = new Audio();
-      // Low-latency audio playback
       audio.srcObject = remoteStream;
       audio.autoplay = true;
       currentCall._remoteAudio = audio;
       initAudioViz(remoteStream);
     });
-
     call.on("close", () => endCall("Peer disconnected"));
     call.on("error", (err) => endCall("Call error: " + err.type));
 
     monitorPeerConnection(call);
     startDurationTimer();
+    requestWakeLock();
     setTimeout(() => showScreen("call"), 400);
   }
 
   // --- Call timeout ---
   let callTimeoutId = null;
-
-  function setCallTimeout() {
-    clearCallTimeout();
-    callTimeoutId = setTimeout(() => {
-      endCall("No answer. The other user may have left.");
-    }, 15000);
-  }
-
-  function clearCallTimeout() {
-    if (callTimeoutId) {
-      clearTimeout(callTimeoutId);
-      callTimeoutId = null;
-    }
-  }
+  function setCallTimeout() { clearCallTimeout(); callTimeoutId = setTimeout(() => endCall("No answer. The other user may have left."), 15000); }
+  function clearCallTimeout() { if (callTimeoutId) { clearTimeout(callTimeoutId); callTimeoutId = null; } }
 
   function endCall(reason) {
     clearCallTimeout();
@@ -596,28 +706,22 @@
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
+    releaseWakeLock();
     reconnectAttempts = 0;
     iceRestarted = false;
     if (currentCall) {
       currentCall.close();
-      if (currentCall._remoteAudio) {
-        currentCall._remoteAudio.pause();
-        currentCall._remoteAudio.srcObject = null;
-      }
+      if (currentCall._remoteAudio) { currentCall._remoteAudio.pause(); currentCall._remoteAudio.srcObject = null; }
       currentCall = null;
     }
     stopLocalStream();
     destroyPeer();
     $("#disconnect-reason").textContent = reason || "The call has ended";
+    announce("Call ended. " + (reason || ""));
     showScreen("disconnected");
   }
 
-  function destroyPeer() {
-    if (peer) {
-      peer.destroy();
-      peer = null;
-    }
-  }
+  function destroyPeer() { if (peer) { peer.destroy(); peer = null; } }
 
   // --- PeerJS connection ---
   async function connectPeer(token) {
@@ -628,27 +732,24 @@
       try {
         await getLocalStream();
       } catch (err) {
-        reject(new Error("Microphone access denied. Please allow microphone permission."));
+        const name = err.name;
+        if (name === "NotAllowedError") reject(new Error("Microphone blocked. Open browser settings, allow microphone for this site, then reload."));
+        else if (name === "NotFoundError") reject(new Error("No microphone detected. Connect a microphone or headset."));
+        else if (name === "NotReadableError") reject(new Error("Microphone in use. Close other apps (Zoom, Teams) and try again."));
+        else reject(new Error("Microphone access denied. Please allow permission."));
         return;
       }
 
       setPhase("signaling");
-
       let isHost = false;
 
-      const p = new Peer(hostId, {
-        debug: 0,
-        config: ICE_CONFIG,
-      });
+      const p = new Peer(hostId, { debug: 0, config: ICE_CONFIG });
 
       p.on("open", (id) => {
         isHost = true;
         currentRole = "host";
         setPhase("ice");
-        p.on("call", (call) => {
-          call.answer(localStream);
-          handleCall(call);
-        });
+        p.on("call", (call) => { call.answer(localStream); handleCall(call); });
         resolve({ peer: p, role: "host" });
       });
 
@@ -656,39 +757,21 @@
         if (err.type === "unavailable-id" && !isHost) {
           p.destroy();
           const guestId = `isay-${token}-guest-${Math.random().toString(36).slice(2, 8)}`;
-          const guestPeer = new Peer(guestId, {
-            debug: 0,
-            config: ICE_CONFIG,
-          });
+          const guestPeer = new Peer(guestId, { debug: 0, config: ICE_CONFIG });
 
           guestPeer.on("open", () => {
             currentRole = "guest";
             setPhase("ice");
             const call = guestPeer.call(hostId, localStream);
-            if (call) {
-              setCallTimeout();
-              handleCall(call);
-            } else {
-              reject(new Error("Failed to initiate call"));
-              return;
-            }
+            if (call) { setCallTimeout(); handleCall(call); }
+            else { reject(new Error("Failed to initiate call")); return; }
             resolve({ peer: guestPeer, role: "guest" });
           });
-
-          guestPeer.on("error", (guestErr) => {
-            reject(guestErr);
-          });
-        } else if (!isHost) {
-          reject(err);
-        }
+          guestPeer.on("error", (guestErr) => reject(guestErr));
+        } else if (!isHost) { reject(err); }
       });
 
-      setTimeout(() => {
-        if (!isHost && !peer) {
-          p.destroy();
-          reject(new Error("Connection timed out"));
-        }
-      }, 10000);
+      setTimeout(() => { if (!isHost && !peer) { p.destroy(); reject(new Error("Connection timed out. Make sure the other person has the link open.")); } }, 10000);
     });
   }
 
@@ -703,6 +786,9 @@
   function showShareLink(token) {
     const link = buildShareLink(token);
     $("#share-link").value = link;
+    // Generate QR code
+    const qrCanvas = $("#qr-canvas");
+    if (qrCanvas) generateQR(link, qrCanvas, 160);
   }
 
   function copyShareLink() {
@@ -711,33 +797,31 @@
     const btn = $("#btn-copy-link");
 
     if (navigator.share) {
-      navigator.share({ title: "iSay Voice Chat", url: link }).catch(() => {});
+      navigator.share({ title: "Join my voice chat", text: `Join my iSay room`, url: link }).catch(() => {});
       return;
     }
 
     navigator.clipboard.writeText(link).then(() => {
       btn.classList.add("copied");
       hint.textContent = "Copied!";
-      setTimeout(() => {
-        btn.classList.remove("copied");
-        hint.textContent = "";
-      }, 2000);
+      haptic(20);
+      setTimeout(() => { btn.classList.remove("copied"); hint.textContent = ""; }, 2000);
     }).catch(() => {
       $("#share-link").select();
       hint.textContent = "Press Ctrl+C to copy";
     });
   }
 
+  // --- Haptic feedback ---
+  function haptic(pattern) {
+    if ("vibrate" in navigator) { try { navigator.vibrate(pattern); } catch (_) {} }
+  }
+
   // --- UI Events ---
   async function joinRoom(token) {
-    if (typeof token !== "string") {
-      token = $("#token-input").value;
-    }
+    if (typeof token !== "string") token = $("#token-input").value;
     token = token.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
-    if (!token) {
-      $("#token-input").focus();
-      return;
-    }
+    if (!token) { $("#token-input").focus(); return; }
 
     showShareLink(token);
     setPhase("signaling");
@@ -746,10 +830,7 @@
     try {
       const result = await connectPeer(token);
       peer = result.peer;
-
-      if (result.role === "host") {
-        $("#call-status-text").textContent = "Connected";
-      }
+      if (result.role === "host") $("#call-status-text").textContent = "Connected";
     } catch (err) {
       destroyPeer();
       stopLocalStream();
@@ -761,13 +842,14 @@
   function toggleMute() {
     if (!localStream) return;
     isMuted = !isMuted;
-    localStream.getAudioTracks().forEach((track) => {
-      track.enabled = !isMuted;
-    });
+    localStream.getAudioTracks().forEach((track) => { track.enabled = !isMuted; });
     $("#btn-mute").classList.toggle("muted", isMuted);
     $("#icon-mic-on").style.display = isMuted ? "none" : "";
     $("#icon-mic-off").style.display = isMuted ? "" : "none";
     $("#mute-label").textContent = isMuted ? "Unmute" : "Mute";
+    $("#btn-mute").setAttribute("aria-pressed", isMuted);
+    haptic(isMuted ? 30 : [20, 10, 20]);
+    announce(isMuted ? "Microphone muted" : "Microphone unmuted");
   }
 
   function restart() {
@@ -776,11 +858,12 @@
     stopAudioViz();
     stopStatsMonitor();
     clearReconnectTimer();
+    releaseWakeLock();
     reconnectAttempts = 0;
     currentToken = null;
     currentRole = null;
     isMuted = false;
-    $("#token-input").value = "";
+    $("#token-input").value = generateToken();
     $("#btn-mute").classList.remove("muted");
     $("#icon-mic-on").style.display = "";
     $("#icon-mic-off").style.display = "none";
@@ -788,25 +871,63 @@
     showScreen("landing");
   }
 
-  // --- Event binding ---
+  // ========== Background / Foreground ==========
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState === "visible" && currentCall) {
+      await requestWakeLock();
+      // Resume AudioContext if suspended (iOS phone call interruption)
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+      // Check ICE state on return
+      const pc = currentCall.peerConnection;
+      if (pc && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
+        attemptICERestart();
+        showToast("Reconnecting after background...");
+      }
+    }
+  });
+
+  // ========== Event binding ==========
   $("#btn-join").addEventListener("click", () => joinRoom());
-  $("#token-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") joinRoom();
-  });
+  $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
   $("#btn-copy-link").addEventListener("click", copyShareLink);
-  $("#btn-cancel-wait").addEventListener("click", () => {
-    destroyPeer();
-    stopLocalStream();
-    showScreen("landing");
-  });
+  $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); showScreen("landing"); });
   $("#btn-mute").addEventListener("click", toggleMute);
   $("#btn-hangup").addEventListener("click", () => endCall("You ended the call"));
   $("#btn-restart").addEventListener("click", restart);
 
-  // Auto-connect if token in URL hash
+  // Space key to toggle mute during call
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && currentCall && !e.repeat) {
+      e.preventDefault();
+      toggleMute();
+    }
+  });
+
+  // ========== Init ==========
+  // Compatibility check
+  const compatIssues = checkCompatibility();
+  if (compatIssues.includes("RTCPeerConnection") || compatIssues.includes("getUserMedia")) {
+    $("#screen-landing").innerHTML = `
+      <div class="container">
+        <h1>iSay</h1>
+        <p class="subtitle" style="color:var(--danger)">Your browser does not support voice chat.</p>
+        <p class="hint">Please use Chrome, Firefox, Edge, or Safari 15+.</p>
+      </div>`;
+    return;
+  }
+  if (compatIssues.includes("https")) {
+    showToast("HTTPS required for microphone. Open via https:// or localhost.", 8000);
+  }
+
+  // Auto-generate token
+  const tokenInput = $("#token-input");
   const hashParams = new URLSearchParams(window.location.hash.slice(1));
   const urlToken = hashParams.get("token") || hashParams.get("room");
   if (urlToken) {
     joinRoom(urlToken);
+  } else {
+    tokenInput.value = generateToken();
   }
 })();

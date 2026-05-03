@@ -9,24 +9,24 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="sr-announcer" aria-live="assertive" aria-atomic="true" class="sr-only"></div>
   <div id="app">
     <!-- Landing -->
     <section id="screen-landing" class="screen active">
       <div class="container">
         <h1>iSay</h1>
-        <p class="subtitle">Enter a shared token to start voice chat</p>
+        <p class="subtitle">Your room is ready. Share the link to start talking.</p>
         <div class="input-group">
-          <input type="text" id="token-input" placeholder="Enter token..." autocomplete="off" maxlength="32">
+          <input type="text" id="token-input" placeholder="Room name..." autocomplete="off" maxlength="32">
           <button id="btn-join">Connect</button>
         </div>
-        <p class="hint">Both users enter the same token to pair</p>
+        <p class="hint">Auto-generated room name, edit if you like</p>
       </div>
     </section>
 
     <!-- Waiting / Connecting phases -->
     <section id="screen-waiting" class="screen">
       <div class="container">
-        <!-- Phase indicator -->
         <div class="phase-indicator" id="phase-indicator">
           <div class="phase-step" data-phase="signaling">
             <div class="phase-dot"></div>
@@ -44,10 +44,18 @@
           </div>
         </div>
         <p class="subtitle" id="phase-label">Initializing...</p>
-        <p class="subtitle">Share this link to invite someone:</p>
+
+        <!-- QR code -->
+        <div class="qr-section">
+          <canvas id="qr-canvas" width="160" height="160"></canvas>
+          <p class="hint">Scan to join</p>
+        </div>
+
+        <!-- Share link -->
+        <p class="subtitle">Or share this link:</p>
         <div class="share-link-box">
           <input type="text" id="share-link" readonly>
-          <button id="btn-copy-link" title="Copy link">
+          <button id="btn-copy-link" title="Copy link" aria-label="Copy link">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
@@ -62,16 +70,14 @@
     <!-- Active call -->
     <section id="screen-call" class="screen">
       <div class="container">
-        <!-- Audio visualizer -->
         <div class="visualizer-wrap">
           <canvas id="visualizer" width="320" height="120"></canvas>
           <div class="visualizer-labels">
-            <span id="label-local">You</span>
-            <span id="label-remote">Peer</span>
+            <span id="label-local" class="user-label">You</span>
+            <span id="label-remote" class="user-label">Peer</span>
           </div>
         </div>
 
-        <!-- Connection info bar -->
         <div class="conn-bar" id="conn-bar">
           <div class="conn-badge" id="conn-type-badge">
             <span class="conn-icon" id="conn-icon">?</span>
@@ -95,7 +101,6 @@
           </div>
         </div>
 
-        <!-- Quality bar -->
         <div class="quality-bar">
           <div class="quality-segments" id="quality-segments">
             <div class="seg"></div><div class="seg"></div><div class="seg"></div><div class="seg"></div><div class="seg"></div>
@@ -106,9 +111,8 @@
         <h2 id="call-status-text">Connected</h2>
         <p class="subtitle" id="call-duration">00:00</p>
 
-        <!-- Controls -->
-        <div class="controls">
-          <button id="btn-mute" class="btn-control" title="Mute">
+        <div class="controls" role="group" aria-label="Call controls">
+          <button id="btn-mute" class="btn-control" title="Mute (Space)" aria-pressed="false" aria-label="Toggle microphone">
             <svg id="icon-mic-on" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
               <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
@@ -124,7 +128,7 @@
             </svg>
             <span id="mute-label">Mute</span>
           </button>
-          <button id="btn-hangup" class="btn-control btn-danger" title="Hang up">
+          <button id="btn-hangup" class="btn-control btn-danger" title="Hang up" aria-label="End call">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/>
               <line x1="23" y1="1" x2="1" y2="23"/>
@@ -149,9 +153,7 @@
   <script src="app.js"></script>
   <script>
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("./sw.js").then((reg) => {
-        reg.update();
-      });
+      navigator.serviceWorker.register("./sw.js").then((reg) => { reg.update(); });
     }
   </script>
 </body>
