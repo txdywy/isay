@@ -9,6 +9,33 @@
   let callStartTime = null;
   let durationTimer = null;
 
+  // --- ICE config (STUN + TURN for 5G/CGNAT) ---
+  const ICE_CONFIG = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:global.stun.twilio.com:3478" },
+      {
+        urls: [
+          "turn:openrelay.metered.ca:80",
+          "turn:openrelay.metered.ca:443",
+          "turn:openrelay.metered.ca:443?transport=tcp",
+        ],
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
+      {
+        urls: [
+          "turns:openrelay.metered.ca:443",
+          "turns:openrelay.metered.ca:443?transport=tcp",
+        ],
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
+    ],
+    iceTransportPolicy: "all",
+  };
+
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
   const screens = {
@@ -53,6 +80,51 @@
     durationTimer = null;
   }
 
+  // --- Connection status ---
+  function updateConnectionStatus(text) {
+    const el = $("#call-conn-status");
+    if (el) el.textContent = text;
+  }
+
+  function monitorPeerConnection(call) {
+    const pc = call.peerConnection;
+    if (!pc) return;
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      switch (state) {
+        case "checking":
+          updateConnectionStatus("Connecting...");
+          break;
+        case "connected":
+        case "completed":
+          // Use getStats to detect if TURN relay is being used
+          pc.getStats().then((stats) => {
+            let isRelay = false;
+            stats.forEach((report) => {
+              if (report.type === "candidate-pair" && report.selectedCandidatePairId) {
+                const local = stats.get(report.localCandidateId);
+                if (local && local.candidateType === "relay") isRelay = true;
+              }
+              if (report.type === "local-candidate" && report.candidateType === "relay") {
+                isRelay = true;
+              }
+            });
+            updateConnectionStatus(isRelay ? "Relay mode (TURN)" : "Direct P2P");
+          }).catch(() => {
+            updateConnectionStatus("Connected");
+          });
+          break;
+        case "disconnected":
+          updateConnectionStatus("Reconnecting...");
+          break;
+        case "failed":
+          endCall("Connection failed. Network may be too restrictive.");
+          break;
+      }
+    };
+  }
+
   // --- Call handling ---
   function handleCall(call) {
     currentCall = call;
@@ -73,6 +145,7 @@
       endCall("Call error: " + err.type);
     });
 
+    monitorPeerConnection(call);
     showScreen("call");
     startDurationTimer();
   }
@@ -135,13 +208,7 @@
 
       const p = new Peer(hostId, {
         debug: 0,
-        config: {
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:stun1.l.google.com:19302" },
-            { urls: "stun:global.stun.twilio.com:3478" },
-          ],
-        },
+        config: ICE_CONFIG,
       });
 
       p.on("open", (id) => {
@@ -161,13 +228,7 @@
           const guestId = `isay-${token}-guest-${Math.random().toString(36).slice(2, 8)}`;
           const guestPeer = new Peer(guestId, {
             debug: 0,
-            config: {
-              iceServers: [
-                { urls: "stun:stun.l.google.com:19302" },
-                { urls: "stun:stun1.l.google.com:19302" },
-                { urls: "stun:global.stun.twilio.com:3478" },
-              ],
-            },
+            config: ICE_CONFIG,
           });
 
           guestPeer.on("open", () => {

@@ -200,6 +200,15 @@ button:active {
   }
 }
 
+/* Connection status */
+.conn-status {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: -16px;
+  margin-bottom: 8px;
+  min-height: 1.2em;
+}
+
 /* Controls */
 .controls {
   display: flex;
