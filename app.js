@@ -435,7 +435,11 @@
 
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0) return; // canvas not visible yet
+    // If canvas isn't laid out yet (just shown), retry next frame
+    if (rect.width === 0) {
+      requestAnimationFrame(() => drawVisualizer());
+      return;
+    }
     const W = rect.width * dpr;
     const H = rect.height * dpr;
     canvas.width = W;
