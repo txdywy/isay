@@ -126,18 +126,11 @@
   // --- ICE config (optimized for 5G + WiFi + restrictive NAT) ---
   const ICE_CONFIG = {
     iceServers: [
-      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302", "stun:stun3.l.google.com:19302", "stun:stun4.l.google.com:19302"] },
-      { urls: "stun:global.stun.twilio.com:3478" },
-      { urls: "stun:stun.nextcloud.com:443" },
+      { urls: "stun:stun.l.google.com:19302" },
       {
-        urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:443?transport=tcp", "turn:openrelay.metered.ca:443?transport=udp"],
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
-      {
-        urls: ["turns:openrelay.metered.ca:443"],
-        username: "openrelayproject",
-        credential: "openrelayproject",
+        urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
+        username: "peerjs",
+        credential: "peerjsp",
       },
     ],
     iceTransportPolicy: "all",
@@ -491,6 +484,11 @@
     };
 
     pc.onicegatheringstatechange = () => console.debug("[iSay] peer iceGatheringState:", pc.iceGatheringState);
+    pc.onicecandidateerror = (err) => console.warn("[iSay] ICE candidate error:", {
+      url: err.url,
+      code: err.errorCode,
+      text: err.errorText,
+    });
     pc.onsignalingstatechange = () => console.debug("[iSay] peer signalingState:", pc.signalingState);
   }
 
