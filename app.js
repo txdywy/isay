@@ -313,42 +313,37 @@
     announce(label[name] || "");
   }
 
-  // ========== QR Code (minimal inline) ==========
-  // Lightweight QR generator - only what we need for a URL
+  // ========== QR Code ==========
   function generateQR(text, canvas, size) {
-    // Use a simple approach: encode text into a data URL via an off-screen approach
-    // For simplicity, use a tiny QR library loaded on demand
-    const ctx = canvas.getContext("2d");
     canvas.width = size;
     canvas.height = size;
+    const ctx = canvas.getContext("2d");
 
-    // Simple binary encoding as placeholder - real QR needs a library
-    // We'll use a different approach: load qr code library dynamically
     if (!generateQR._loaded) {
       const script = document.createElement("script");
-      script.src = "https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js";
+      script.src = "https://cdn.jsdelivr.net/npm/qrcode@latest/build/qrcode.min.js";
       script.onload = () => {
         generateQR._loaded = true;
         generateQR(text, canvas, size);
       };
       script.onerror = () => {
-        // Fallback: show text
         ctx.fillStyle = "#1a1a1a";
         ctx.fillRect(0, 0, size, size);
         ctx.fillStyle = "#888";
-        ctx.font = "12px monospace";
+        ctx.font = "12px sans-serif";
         ctx.textAlign = "center";
-        ctx.fillText("QR not available", size / 2, size / 2);
+        ctx.fillText("QR unavailable", size / 2, size / 2);
       };
       document.head.appendChild(script);
       return;
     }
 
-    if (typeof QRCode !== "undefined") {
+    try {
       QRCode.toCanvas(canvas, text, {
         width: size,
         margin: 2,
-        color: { dark: "#4f9cf7", light: "#1a1a1a" },
+        color: { dark: "4f9cf7", light: "1a1a1a" },
+        errorCorrectionLevel: "M",
       }, (err) => {
         if (err) {
           ctx.fillStyle = "#1a1a1a";
@@ -359,6 +354,13 @@
           ctx.fillText("QR error", size / 2, size / 2);
         }
       });
+    } catch (_) {
+      ctx.fillStyle = "#1a1a1a";
+      ctx.fillRect(0, 0, size, size);
+      ctx.fillStyle = "#888";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("QR error", size / 2, size / 2);
     }
   }
 
