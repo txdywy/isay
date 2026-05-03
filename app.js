@@ -225,7 +225,10 @@
   }
 
   // --- Adaptive bitrate ---
+  let bitrateAppliedOnce = false;
   async function adaptAudioBitrate(pc, loss, jitter, rtt) {
+    // Skip first call - SDP may not be fully applied yet
+    if (!bitrateAppliedOnce) { bitrateAppliedOnce = true; return; }
     const sender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
     if (!sender) return;
     try {
@@ -235,11 +238,11 @@
       }
       let targetBitrate;
       if (loss > 10 || jitter > 100 || rtt > 0.5) {
-        targetBitrate = 12000; // Poor: narrowband
+        targetBitrate = 12000;
       } else if (loss > 3 || jitter > 50 || rtt > 0.3) {
-        targetBitrate = 24000; // Moderate: super-wideband
+        targetBitrate = 24000;
       } else {
-        targetBitrate = 48000; // Good: fullband
+        targetBitrate = 48000;
       }
       params.encodings[0].maxBitrate = targetBitrate;
       params.encodings[0].priority = "high";
@@ -376,6 +379,11 @@
       audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
     } catch (_) { return; }
 
+    // iOS Safari: AudioContext starts suspended, must resume after user gesture
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+
     const localSrc = audioCtx.createMediaStreamSource(localStream);
     localAnalyser = audioCtx.createAnalyser();
     localAnalyser.fftSize = 256;
@@ -396,26 +404,36 @@
   function drawVisualizer() {
     const canvas = $("#visualizer");
     if (!canvas) return;
+
+    // DPI-aware canvas sizing for Retina/HiDPI displays
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    const W = rect.width * dpr;
+    const H = rect.height * dpr;
+    canvas.width = W;
+    canvas.height = H;
     const ctx = canvas.getContext("2d");
-    const W = canvas.width;
-    const H = canvas.height;
+    ctx.scale(dpr, dpr);
+
+    const logicalW = rect.width;
+    const logicalH = rect.height;
     const bufLen = localAnalyser ? localAnalyser.frequencyBinCount : 128;
     const localData = new Uint8Array(bufLen);
     const remoteData = new Uint8Array(bufLen);
 
     function draw() {
       vizRAF = requestAnimationFrame(draw);
-      ctx.clearRect(0, 0, W, H);
+      ctx.clearRect(0, 0, logicalW, logicalH);
 
       if (localAnalyser) localAnalyser.getByteFrequencyData(localData);
       if (remoteAnalyser) remoteAnalyser.getByteFrequencyData(remoteData);
 
       const barCount = 40;
-      const barW = (W - (barCount - 1) * 2) / barCount;
+      const barW = (logicalW - (barCount - 1) * 2) / barCount;
       const step = Math.floor(bufLen / barCount);
 
-      drawBars(ctx, remoteData, barCount, barW, step, W, H, "#22c55e", 0.7, true);
-      drawBars(ctx, localData, barCount, barW, step, W, H, "#4f9cf7", 0.8, false);
+      drawBars(ctx, remoteData, barCount, barW, step, logicalW, logicalH, "#22c55e", 0.7, true);
+      drawBars(ctx, localData, barCount, barW, step, logicalW, logicalH, "#4f9cf7", 0.8, false);
       updateSpeakingIndicators();
     }
 
@@ -668,6 +686,8 @@
       const audio = new Audio();
       audio.srcObject = remoteStream;
       audio.autoplay = true;
+      // iOS/Safari: explicit play() may be needed even with autoplay
+      audio.play().catch(() => {});
       currentCall._remoteAudio = audio;
       initAudioViz(remoteStream);
     });
@@ -694,6 +714,7 @@
     releaseWakeLock();
     reconnectAttempts = 0;
     iceRestarted = false;
+    bitrateAppliedOnce = false;
     if (currentCall) {
       currentCall.close();
       if (currentCall._remoteAudio) { currentCall._remoteAudio.pause(); currentCall._remoteAudio.srcObject = null; }
@@ -780,20 +801,39 @@
     const hint = $("#copy-hint");
     const btn = $("#btn-copy-link");
 
-    if (navigator.share) {
-      navigator.share({ title: "Join my voice chat", text: `Join my iSay room`, url: link }).catch(() => {});
-      return;
-    }
-
-    navigator.clipboard.writeText(link).then(() => {
+    const showCopied = () => {
       btn.classList.add("copied");
       hint.textContent = "Copied!";
       haptic(20);
       setTimeout(() => { btn.classList.remove("copied"); hint.textContent = ""; }, 2000);
-    }).catch(() => {
-      $("#share-link").select();
-      hint.textContent = "Press Ctrl+C to copy";
-    });
+    };
+
+    // Mobile: try Web Share API first
+    if (navigator.share && /Mobi|Android/i.test(navigator.userAgent)) {
+      navigator.share({ title: "Join my voice chat", text: "Join my iSay room", url: link }).catch(() => {});
+      return;
+    }
+
+    // Modern browsers
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(link).then(showCopied).catch(() => {
+        fallbackCopy(link, hint, showCopied);
+      });
+    } else {
+      fallbackCopy(link, hint, showCopied);
+    }
+  }
+
+  function fallbackCopy(text, hintEl, onSuccess) {
+    const input = $("#share-link");
+    input.select();
+    input.setSelectionRange(0, 99999); // iOS Safari requires this
+    try {
+      document.execCommand("copy");
+      onSuccess();
+    } catch (_) {
+      hintEl.textContent = "Press Ctrl+C to copy";
+    }
   }
 
   // --- Haptic feedback ---
@@ -844,6 +884,7 @@
     clearReconnectTimer();
     releaseWakeLock();
     reconnectAttempts = 0;
+    bitrateAppliedOnce = false;
     currentToken = null;
     currentRole = null;
     isMuted = false;

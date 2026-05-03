@@ -26,9 +26,13 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
+  min-height: 100dvh; /* iOS dynamic viewport height */
   display: flex;
   align-items: center;
   justify-content: center;
+  /* iOS safe areas for notch devices */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust: 100%;
 }
 
 #app {
@@ -105,6 +109,8 @@ button {
   font-weight: 500;
   cursor: pointer;
   transition: background 0.2s, transform 0.1s;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 button:hover {
@@ -148,7 +154,7 @@ button:active {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--primary);
-  font-size: 0.85rem;
+  font-size: max(0.85rem, 16px); /* iOS: prevent zoom on focus (< 16px triggers zoom) */
   font-family: "SF Mono", "Fira Code", monospace;
   outline: none;
   cursor: text;
