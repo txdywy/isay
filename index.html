@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>iSay - P2P Voice Chat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Landing: enter token to pair -->
+    <section id="screen-landing" class="screen active">
+      <div class="container">
+        <h1>iSay</h1>
+        <p class="subtitle">Enter a shared token to start voice chat</p>
+        <div class="input-group">
+          <input type="text" id="token-input" placeholder="Enter token..." autocomplete="off" maxlength="32">
+          <button id="btn-join">Connect</button>
+        </div>
+        <p class="hint">Both users enter the same token to pair</p>
+      </div>
+    </section>
+
+    <!-- Waiting for peer -->
+    <section id="screen-waiting" class="screen">
+      <div class="container">
+        <div class="spinner"></div>
+        <h2>Waiting for peer...</h2>
+        <p class="subtitle">Share this token with the other person:</p>
+        <div class="token-display" id="token-display"></div>
+        <button id="btn-cancel-wait" class="btn-secondary">Cancel</button>
+      </div>
+    </section>
+
+    <!-- Active call -->
+    <section id="screen-call" class="screen">
+      <div class="container">
+        <div class="call-status">
+          <div class="pulse-ring"></div>
+          <div class="call-icon">🎙</div>
+        </div>
+        <h2 id="call-status-text">Connected</h2>
+        <p class="subtitle" id="call-duration">00:00</p>
+        <div class="controls">
+          <button id="btn-mute" class="btn-control" title="Mute">
+            <svg id="icon-mic-on" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+            <svg id="icon-mic-off" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+              <line x1="1" y1="1" x2="23" y2="23"/>
+              <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+              <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .38-.03.75-.08 1.12"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+            <span id="mute-label">Mute</span>
+          </button>
+          <button id="btn-hangup" class="btn-control btn-danger" title="Hang up">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/>
+              <line x1="23" y1="1" x2="1" y2="23"/>
+            </svg>
+            <span>Hang Up</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Disconnected -->
+    <section id="screen-disconnected" class="screen">
+      <div class="container">
+        <h2>Call Ended</h2>
+        <p class="subtitle" id="disconnect-reason">The call has ended</p>
+        <button id="btn-restart">New Call</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
