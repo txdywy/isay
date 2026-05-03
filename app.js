@@ -14,13 +14,43 @@
   let vizRAF = null;
   let statsInterval = null;
   let prevStats = null;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  let currentToken = null;
+  let currentRole = null;
+  let iceRestarted = false;
 
-  // --- ICE config ---
+  const MAX_RECONNECT_ATTEMPTS = 3;
+  const ICE_RECONNECT_WAIT = 4000; // wait before attempting ICE restart
+  const RECONNECT_BACKOFF = [2000, 4000, 8000];
+
+  // --- Audio constraints: optimized for voice ---
+  const AUDIO_CONSTRAINTS = {
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      sampleRate: 48000,
+      channelCount: 1,
+      // Advanced Chrome-only hints
+      googEchoCancellation: true,
+      googAutoGainControl: true,
+      googNoiseSuppression: true,
+      googHighpassFilter: true,
+      googTypingNoiseDetection: true,
+    },
+    video: false,
+  };
+
+  // --- ICE config: optimized for speed + reachability ---
   const ICE_CONFIG = {
     iceServers: [
+      // Multiple STUN for faster candidate gathering
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
       { urls: "stun:global.stun.twilio.com:3478" },
+      // TURN: UDP primary, TCP fallback for restrictive NAT
       {
         urls: [
           "turn:openrelay.metered.ca:80",
@@ -40,6 +70,9 @@
       },
     ],
     iceTransportPolicy: "all",
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require",
+    iceCandidatePoolSize: 2,
   };
 
   // --- DOM ---
@@ -59,7 +92,7 @@
   // --- Media ---
   async function getLocalStream() {
     if (localStream) return localStream;
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    localStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
     return localStream;
   }
 
@@ -68,6 +101,67 @@
       localStream.getTracks().forEach((t) => t.stop());
       localStream = null;
     }
+  }
+
+  // --- SDP optimization: tune Opus for voice ---
+  function optimizeSDP(sdp) {
+    // Find Opus payload type
+    const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+    if (!opusMatch) return sdp;
+    const opusPT = opusMatch[1];
+
+    // Add/replace fmtp line with optimized parameters
+    const fmtpLine = `a=fmtp:${opusPT} minptime=10;useinbandfec=1;maxaveragebitrate=32000;stereo=0;cbr=0;sprop-stereo=0`;
+
+    const lines = sdp.split("\r\n");
+    let replaced = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith(`a=fmtp:${opusPT}`)) {
+        lines[i] = fmtpLine;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      // Insert after rtpmap line
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith(`a=rtpmap:${opusPT}`)) {
+          lines.splice(i + 1, 0, fmtpLine);
+          break;
+        }
+      }
+    }
+    return lines.join("\r\n");
+  }
+
+  function applySDPOptimization(call) {
+    const pc = call.peerConnection;
+    if (!pc) return;
+
+    // Intercept SDP for offer
+    const origCreateOffer = pc.createOffer.bind(pc);
+    pc.createOffer = async function (...args) {
+      const offer = await origCreateOffer(...args);
+      offer.sdp = optimizeSDP(offer.sdp);
+      return offer;
+    };
+
+    // Intercept SDP for answer
+    const origCreateAnswer = pc.createAnswer.bind(pc);
+    pc.createAnswer = async function (...args) {
+      const answer = await origCreateAnswer(...args);
+      answer.sdp = optimizeSDP(answer.sdp);
+      return answer;
+    };
+
+    // Also optimize any pending remote description
+    const origSetRemote = pc.setRemoteDescription.bind(pc);
+    pc.setRemoteDescription = async function (desc) {
+      if (desc && desc.sdp) {
+        desc.sdp = optimizeSDP(desc.sdp);
+      }
+      return origSetRemote(desc);
+    };
   }
 
   // --- Duration ---
@@ -117,17 +211,17 @@
       return;
     }
 
-    // Local analyser
     const localSrc = audioCtx.createMediaStreamSource(localStream);
     localAnalyser = audioCtx.createAnalyser();
     localAnalyser.fftSize = 256;
+    localAnalyser.smoothingTimeConstant = 0.8;
     localSrc.connect(localAnalyser);
 
-    // Remote analyser
     if (remoteStream) {
       const remoteSrc = audioCtx.createMediaStreamSource(remoteStream);
       remoteAnalyser = audioCtx.createAnalyser();
       remoteAnalyser.fftSize = 256;
+      remoteAnalyser.smoothingTimeConstant = 0.8;
       remoteSrc.connect(remoteAnalyser);
     }
 
@@ -155,9 +249,7 @@
       const barW = (W - (barCount - 1) * 2) / barCount;
       const step = Math.floor(bufLen / barCount);
 
-      // Draw remote (bottom half, green)
       drawBars(ctx, remoteData, barCount, barW, step, W, H, "#22c55e", 0.7, true);
-      // Draw local (top half, blue)
       drawBars(ctx, localData, barCount, barW, step, W, H, "#4f9cf7", 0.8, false);
     }
 
@@ -246,12 +338,10 @@
     jv.textContent = jitter >= 0 ? Math.round(jitter) : "--";
     lo.textContent = loss >= 0 ? loss.toFixed(1) + "%" : "--";
 
-    // Color code latency
     lv.style.color = latency < 0 ? "" : latency < 100 ? "var(--success)" : latency < 300 ? "var(--warning)" : "var(--danger)";
     jv.style.color = jitter < 0 ? "" : jitter < 30 ? "var(--success)" : jitter < 80 ? "var(--warning)" : "var(--danger)";
     lo.style.color = loss < 0 ? "" : loss < 2 ? "var(--success)" : loss < 5 ? "var(--warning)" : "var(--danger)";
 
-    // Overall quality score (1-5)
     if (latency >= 0) {
       let score = 5;
       if (latency > 150) score--;
@@ -260,7 +350,6 @@
       if (loss > 3) score--;
       if (loss > 8) score--;
       score = Math.max(1, score);
-
       const labels = { 1: "Terrible", 2: "Poor", 3: "Fair", 4: "Good", 5: "Excellent" };
       setQuality(score, labels[score]);
     }
@@ -268,6 +357,7 @@
 
   function startStatsMonitor(pc) {
     prevStats = null;
+    let consecBad = 0;
     statsInterval = setInterval(() => {
       if (!pc || pc.connectionState === "closed") {
         stopStatsMonitor();
@@ -288,24 +378,52 @@
 
         if (currentPair) {
           const latency = currentPair.currentRoundTripTime ? currentPair.currentRoundTripTime * 1000 : -1;
-
-          // Calculate packet loss from inbound-rtp
           let loss = -1;
           let jitter = -1;
+
           stats.forEach((report) => {
             if (report.type === "inbound-rtp" && report.kind === "audio") {
-              const total = report.packetsReceived + (report.packetsLost || 0);
-              if (total > 0) {
-                loss = ((report.packetsLost || 0) / total) * 100;
+              // Use delta packet loss for real-time accuracy
+              if (prevStats && prevStats[report.id]) {
+                const prev = prevStats[report.id];
+                const dRecv = report.packetsReceived - prev.packetsReceived;
+                const dLost = (report.packetsLost || 0) - (prev.packetsLost || 0);
+                const total = dRecv + dLost;
+                if (total > 0) {
+                  loss = (dLost / total) * 100;
+                }
+              } else {
+                const total = report.packetsReceived + (report.packetsLost || 0);
+                if (total > 0) {
+                  loss = ((report.packetsLost || 0) / total) * 100;
+                }
               }
               if (report.jitter !== undefined) {
                 jitter = report.jitter * 1000;
               }
+
+              // Save for next delta
+              if (!prevStats) prevStats = {};
+              prevStats[report.id] = {
+                packetsReceived: report.packetsReceived,
+                packetsLost: report.packetsLost || 0,
+              };
             }
           });
 
           updateMetrics(latency, jitter, loss);
           setConnType(isRelay ? "relay" : "p2p");
+
+          // Track consecutive bad quality for proactive recovery
+          if (loss > 15 || latency > 500) {
+            consecBad++;
+            if (consecBad >= 3 && currentCall) {
+              attemptICERestart();
+              consecBad = 0;
+            }
+          } else {
+            consecBad = 0;
+          }
         }
       }).catch(() => {});
     }, 2000);
@@ -317,10 +435,76 @@
     prevStats = null;
   }
 
+  // ========== ICE restart & reconnection ==========
+  function attemptICERestart() {
+    if (!currentCall || !currentCall.peerConnection) return;
+    const pc = currentCall.peerConnection;
+    if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+      try {
+        pc.restartIce();
+      } catch (_) {}
+    }
+  }
+
+  function scheduleReconnect() {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      endCall("Connection lost. Max reconnection attempts reached.");
+      return;
+    }
+
+    const delay = RECONNECT_BACKOFF[Math.min(reconnectAttempts, RECONNECT_BACKOFF.length - 1)];
+    setConnType("disconnected");
+    updateMetrics(-1, -1, -1);
+    setQuality(0, "Reconnecting...");
+    const lbl = $("#phase-label");
+    if (lbl) lbl.textContent = `Reconnecting in ${Math.ceil(delay / 1000)}s (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`;
+
+    clearReconnectTimer();
+    reconnectTimer = setTimeout(async () => {
+      reconnectAttempts++;
+      if (!currentToken) {
+        endCall("Connection lost.");
+        return;
+      }
+
+      // Clean up old connection
+      if (currentCall) {
+        currentCall.close();
+        if (currentCall._remoteAudio) {
+          currentCall._remoteAudio.pause();
+          currentCall._remoteAudio.srcObject = null;
+        }
+        currentCall = null;
+      }
+      stopAudioViz();
+      stopStatsMonitor();
+      destroyPeer();
+
+      // Reconnect
+      showScreen("waiting");
+      setPhase("signaling");
+      try {
+        const result = await connectPeer(currentToken);
+        peer = result.peer;
+      } catch (err) {
+        endCall("Reconnection failed: " + (err.message || "unknown error"));
+      }
+    }, delay);
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
   // ========== Peer connection monitoring ==========
   function monitorPeerConnection(call) {
     const pc = call.peerConnection;
     if (!pc) return;
+
+    iceRestarted = false;
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
@@ -330,17 +514,35 @@
           break;
         case "connected":
         case "completed":
+          reconnectAttempts = 0;
+          iceRestarted = false;
           startStatsMonitor(pc);
           break;
         case "disconnected":
-          setConnType("disconnected");
-          updateMetrics(-1, -1, -1);
-          setQuality(0, "Reconnecting");
+          // Try ICE restart first before full reconnect
+          if (!iceRestarted) {
+            iceRestarted = true;
+            setConnType("disconnected");
+            setTimeout(() => {
+              if (pc.iceConnectionState === "disconnected") {
+                attemptICERestart();
+              }
+            }, ICE_RECONNECT_WAIT);
+          } else {
+            scheduleReconnect();
+          }
           break;
         case "failed":
-          setConnType("failed");
-          endCall("Connection failed. Network may be too restrictive.");
+          scheduleReconnect();
           break;
+      }
+    };
+
+    // Also monitor connectionState for better coverage
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      if (state === "failed") {
+        scheduleReconnect();
       }
     };
   }
@@ -351,8 +553,12 @@
     clearCallTimeout();
     setPhase("connected");
 
+    // Apply SDP optimization for Opus codec
+    applySDPOptimization(call);
+
     call.on("stream", (remoteStream) => {
       const audio = new Audio();
+      // Low-latency audio playback
       audio.srcObject = remoteStream;
       audio.autoplay = true;
       currentCall._remoteAudio = audio;
@@ -364,7 +570,6 @@
 
     monitorPeerConnection(call);
     startDurationTimer();
-    // Short delay so phase transition animation plays before switching screen
     setTimeout(() => showScreen("call"), 400);
   }
 
@@ -387,9 +592,12 @@
 
   function endCall(reason) {
     clearCallTimeout();
+    clearReconnectTimer();
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
+    reconnectAttempts = 0;
+    iceRestarted = false;
     if (currentCall) {
       currentCall.close();
       if (currentCall._remoteAudio) {
@@ -414,6 +622,7 @@
   // --- PeerJS connection ---
   async function connectPeer(token) {
     const hostId = `isay-${token}-host`;
+    currentToken = token;
 
     return new Promise(async (resolve, reject) => {
       try {
@@ -434,6 +643,7 @@
 
       p.on("open", (id) => {
         isHost = true;
+        currentRole = "host";
         setPhase("ice");
         p.on("call", (call) => {
           call.answer(localStream);
@@ -452,6 +662,7 @@
           });
 
           guestPeer.on("open", () => {
+            currentRole = "guest";
             setPhase("ice");
             const call = guestPeer.call(hostId, localStream);
             if (call) {
@@ -564,6 +775,10 @@
     stopLocalStream();
     stopAudioViz();
     stopStatsMonitor();
+    clearReconnectTimer();
+    reconnectAttempts = 0;
+    currentToken = null;
+    currentRole = null;
     isMuted = false;
     $("#token-input").value = "";
     $("#btn-mute").classList.remove("muted");
