@@ -105,6 +105,10 @@
     return issues;
   }
 
+  // --- Safari detection ---
+  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
   // --- Audio constraints (optimized for low latency voice) ---
   const AUDIO_CONSTRAINTS = {
     audio: {
@@ -181,17 +185,19 @@
   }
 
   // --- SDP optimization (low latency, high quality voice) ---
+  // Safari is strict about opus fmtp params: keep it conservative there.
   function optimizeSDP(sdp) {
     const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
     if (!opusMatch) return sdp;
     const opusPT = opusMatch[1];
-    // useinbandfec=1: packet loss resilience via FEC
-    // maxaveragebitrate=48000: fullband quality (~48kbps average)
-    // usedtx=1: silence suppression (DTX) to save bandwidth
-    // cbr=0: variable bitrate for best quality at target bitrate
-    // stereo=0; sprop-stereo=0: mono for lower latency and bandwidth
-    // maxplaybackrate=48000; sprop-maxcapturerate=48000: fullband 48kHz
-    const fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
+    let fmtpLine;
+    if (isSafari) {
+      // Safari/iOS: minimal safe opus params
+      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;maxplaybackrate=48000`;
+    } else {
+      // Chrome/Firefox/Edge: full low-latency tuning
+      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
+    }
     const lines = sdp.split("\r\n");
     let replaced = false;
     let lastOpusIdx = -1;
@@ -207,11 +213,13 @@
     if (!replaced && lastOpusIdx >= 0) {
       lines.splice(lastOpusIdx + 1, 0, fmtpLine);
     }
-    // Add ptime/maxptime for consistent packetization (20ms optimal for voice)
-    const hasPtime = lines.some(l => l === "a=ptime:20");
-    const hasMaxptime = lines.some(l => l === "a=maxptime:60");
-    if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
-    if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
+    // ptime/maxptime: Safari ignores or rejects these; skip on Safari
+    if (!isSafari) {
+      const hasPtime = lines.some((l) => l === "a=ptime:20");
+      const hasMaxptime = lines.some((l) => l === "a=maxptime:60");
+      if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
+      if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
+    }
     return lines.join("\r\n");
   }
 
@@ -391,6 +399,15 @@
     remoteAudio.playsInline = true;
     remoteAudio.setAttribute("playsinline", "");
     remoteAudio.volume = speakerOn ? 0.85 : 1.0; // Reduce echo in speakerphone mode
+    // Safari requires audio element to be in the DOM tree to play
+    if (isSafari) {
+      remoteAudio.style.position = "absolute";
+      remoteAudio.style.opacity = "0";
+      remoteAudio.style.pointerEvents = "none";
+      remoteAudio.style.width = "1px";
+      remoteAudio.style.height = "1px";
+      document.body.appendChild(remoteAudio);
+    }
     remoteAudio.play().catch(() => {});
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
@@ -435,6 +452,9 @@
     if (info.remoteAudio) {
       info.remoteAudio.pause();
       info.remoteAudio.srcObject = null;
+      if (isSafari && info.remoteAudio.parentNode) {
+        info.remoteAudio.parentNode.removeChild(info.remoteAudio);
+      }
     }
     updatePeerCount();
     if (peers.size === 0 && currentToken) {
@@ -449,6 +469,9 @@
       if (info.remoteAudio) {
         info.remoteAudio.pause();
         info.remoteAudio.srcObject = null;
+        if (isSafari && info.remoteAudio.parentNode) {
+          info.remoteAudio.parentNode.removeChild(info.remoteAudio);
+        }
       }
     }
     peers.clear();
