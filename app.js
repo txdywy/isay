@@ -211,10 +211,43 @@
     }
   }
 
-  // SDP optimization disabled — monkey-patching createOffer/createAnswer/
-  // setRemoteDescription was breaking ICE negotiation.
-  // Audio quality is tuned via RTP sender.setParameters() in adaptAudioBitrate() instead.
-  function applySDPOptimization(_call) { /* no-op */ }
+  // --- Audio Connection Optimization ---
+  // Apply initial high-quality audio parameters via RTP sender and receiver
+  function optimizeAudioConnection(call) {
+    const tryOptimize = () => {
+      const pc = call.peerConnection;
+      if (!pc) {
+        requestAnimationFrame(tryOptimize);
+        return;
+      }
+      const sender = pc.getSenders().find((s) => s.track && s.track.kind === "audio");
+      const receiver = pc.getReceivers().find((r) => r.track && r.track.kind === "audio");
+      
+      if (!sender && !receiver) {
+        setTimeout(tryOptimize, 100);
+        return;
+      }
+
+      // Optimize sender (bitrate/priority)
+      if (sender) {
+        try {
+          const params = sender.getParameters();
+          if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+          params.encodings[0].maxBitrate = 64000;
+          params.encodings[0].priority = "high";
+          sender.setParameters(params).catch(() => {});
+        } catch (_) {}
+      }
+
+      // Optimize receiver (jitter buffer)
+      if (receiver && "jitterBufferTarget" in receiver) {
+        try {
+          receiver.jitterBufferTarget = 10; // Initial low latency target
+        } catch (_) {}
+      }
+    };
+    tryOptimize();
+  }
 
   // --- Adaptive bitrate ---
   async function adaptAudioBitrate(pc, loss, jitter, rtt) {
@@ -1050,7 +1083,7 @@
       try { call.close(); } catch (_) {}
       return;
     }
-    applySDPOptimization(call);
+    optimizeAudioConnection(call);
     monitorSinglePeerConnection(call.peerConnection);
 
     // Guard against zombie calls: if stream never arrives after answer, close it
@@ -1140,7 +1173,7 @@
     // PeerJS creates peerConnection asynchronously; retry patch/monitor at multiple intervals
     [0, 50, 150, 400].forEach((ms) => {
       setTimeout(() => {
-        applySDPOptimization(call);
+        optimizeAudioConnection(call);
         monitorSinglePeerConnection(call.peerConnection);
       }, ms);
     });
