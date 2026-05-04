@@ -469,7 +469,12 @@
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.8;
         src.connect(analyser);
-      } catch (_) {}
+        // iOS Safari/ChromeWKWebView: HTMLAudioElement often fails to play WebRTC stream.
+        // Route remote audio through AudioContext.destination as reliable fallback.
+        src.connect(audioCtx.destination);
+      } catch (e) {
+        console.warn("[iSay] WebAudio routing failed:", e);
+      }
     }
 
     peers.set(peerId, { call, remoteAudio, analyser });
@@ -729,9 +734,11 @@
 
   // ========== Audio Visualizer ==========
   function initAudioViz() {
-    try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-    } catch (_) { return; }
+    if (!audioCtx) {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+      } catch (_) { return; }
+    }
     if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
 
     const localSrc = audioCtx.createMediaStreamSource(localStream);
@@ -1528,6 +1535,17 @@
 
     // Unlock autoplay as early as possible (must be inside user-gesture handler)
     unlockAudio();
+
+    // iOS requires AudioContext.resume() inside a user gesture.
+    // Create / resume it here so addPeer can safely connect streams to destination.
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+    } catch (_) {}
 
     setPhase("signaling");
     showScreen("waiting");
