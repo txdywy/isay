@@ -22,6 +22,7 @@
   let speakerOn = true;
   let networkMigrationInitialized = false;
   let meshScanTimer = null;
+  let hostScanTimer = null;
 
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
@@ -476,9 +477,37 @@
     }
   }
 
+  function clearHostScanTimer() {
+    if (hostScanTimer) {
+      clearInterval(hostScanTimer);
+      hostScanTimer = null;
+    }
+  }
+
+  function startHostScan(token) {
+    if (!peer || !peer.open || currentRole !== "host") return;
+    if (hostScanTimer) return;
+    const doScan = () => {
+      if (!peer || !peer.open || currentRole !== "host" || peers.size > 0) {
+        clearHostScanTimer();
+        return;
+      }
+      for (let i = 0; i < MAX_PEERS; i++) {
+        const guestId = `isay-${token}-g${i}`;
+        if (!peers.has(guestId) && !pendingCalls.has(guestId)) {
+          initiateCall(guestId, { maxAttempts: 1 });
+        }
+      }
+    };
+    // Delay first scan so guest has time to open its page
+    setTimeout(doScan, 800);
+    hostScanTimer = setInterval(doScan, MESH_SCAN_INTERVAL);
+  }
+
   // ========== Connection monitoring (per-peer) ==========
   function monitorSinglePeerConnection(pc) {
-    if (!pc) return;
+    if (!pc || pc._isayMonitored) return;
+    pc._isayMonitored = true;
     setupNetworkMigration();
 
     let disconnectedTimer = null;
@@ -1124,11 +1153,13 @@
     }
 
     console.debug("[iSay] dialing peer:", targetPeerId, "attempt:", attempt);
-    // Defer patch slightly so PeerJS finishes internal peerConnection setup
-    setTimeout(() => {
-      applySDPOptimization(call);
-      monitorSinglePeerConnection(call.peerConnection);
-    }, 0);
+    // PeerJS creates peerConnection asynchronously; retry patch/monitor at multiple intervals
+    [0, 50, 150, 400].forEach((ms) => {
+      setTimeout(() => {
+        applySDPOptimization(call);
+        monitorSinglePeerConnection(call.peerConnection);
+      }, ms);
+    });
 
     const timer = setTimeout(() => {
       if (peers.has(targetPeerId)) return;
@@ -1295,6 +1326,8 @@
         // Listen for all incoming calls (mesh)
         p.on("call", (call) => handleIncomingCall(call));
         initAudioViz();
+        // Host also scans guest slots (bidirectional discovery)
+        startHostScan(token);
         resolve({ role: "host" });
       });
 
@@ -1331,8 +1364,13 @@
               // Initiate audio viz for local stream
               initAudioViz();
 
-              // Connect to host first. Other occupied guest slots are secondary mesh links.
-              initiateCall(hostId, { maxAttempts: HOST_RETRY_DELAYS.length, retryDelays: HOST_RETRY_DELAYS, required: true });
+              // Connect to host first. Small delay lets PeerJS server sync host state.
+              setTimeout(() => {
+                if (peer && peer.open) {
+                  initiateCall(hostId, { maxAttempts: HOST_RETRY_DELAYS.length, retryDelays: HOST_RETRY_DELAYS, required: true });
+                }
+              }, 400);
+              // Also proactively scan backwards in case our call to host was dropped by signaling server
               for (let i = 0; i < guestIdx; i++) {
                 const id = `isay-${token}-g${i}`;
                 setTimeout(() => {
@@ -1452,6 +1490,7 @@
   function endCall(reason) {
     clearReconnectTimer();
     clearMeshScanTimer();
+    clearHostScanTimer();
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
@@ -1493,6 +1532,7 @@
     stopStatsMonitor();
     clearReconnectTimer();
     clearMeshScanTimer();
+    clearHostScanTimer();
     releaseWakeLock();
     reconnectAttempts = 0;
     currentToken = null;
