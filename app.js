@@ -129,29 +129,16 @@
   };
 
   // --- ICE config ---
-  // Cloudflare STUN is globally reachable (including China).
-  // Metered OpenRelay provides free TURN (20GB/month).
-  // Multiple TURN transports (UDP + TCP + TLS on 443) for restrictive NATs/firewalls.
+  // WiFi/LAN: host candidates connect directly, no STUN needed.
+  // STUN only needed for cross-network (discovers public IP).
+  // TURN needed for symmetric NAT (cellular) — add your own if needed.
   const ICE_CONFIG = {
     iceServers: [
-      { urls: "stun:stun.cloudflare.com:3478" },
       { urls: "stun:stun.l.google.com:19302" },
-      {
-        urls: [
-          "turn:standard.relay.metered.ca:80",
-          "turn:standard.relay.metered.ca:80?transport=tcp",
-          "turn:standard.relay.metered.ca:443",
-          "turn:standard.relay.metered.ca:443?transport=tcp",
-          "turns:standard.relay.metered.ca:443?transport=tcp",
-        ],
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:global.stun.twilio.com:3478" },
     ],
     iceTransportPolicy: "all",
-    bundlePolicy: "max-bundle",
-    rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 2,
   };
 
   // --- DOM ---
@@ -434,55 +421,16 @@
       return;
     }
 
-    // --- Remote audio playback via HTMLAudioElement ---
+    // --- Remote audio playback (keep it simple — original working approach) ---
     const remoteAudio = new Audio();
     remoteAudio.srcObject = stream;
     remoteAudio.autoplay = true;
-    remoteAudio.playsInline = true;
-    remoteAudio.setAttribute("playsinline", "");
-    remoteAudio.muted = false;
     remoteAudio.volume = speakerOn ? 0.85 : 1.0;
-    // Always add audio element to DOM — some browsers (including certain Chrome
-    // versions) need this for reliable WebRTC MediaStream playback.
-    remoteAudio.style.position = "absolute";
-    remoteAudio.style.opacity = "0";
-    remoteAudio.style.pointerEvents = "none";
-    remoteAudio.style.width = "1px";
-    remoteAudio.style.height = "1px";
-    document.body.appendChild(remoteAudio);
-
-    // Diagnostic: log stream track info
-    const audioTracks = stream.getAudioTracks();
-    console.debug("[iSay] addPeer stream tracks:", peerId, "audioTracks:", audioTracks.length, "readyStates:", audioTracks.map((t) => t.readyState), "muted:", audioTracks.map((t) => t.muted), "enabled:", audioTracks.map((t) => t.enabled));
-
-    const doPlay = () => {
-      if (remoteAudio.paused) {
-        remoteAudio.play().then(() => {
-          console.debug("[iSay] remoteAudio playing:", peerId);
-        }).catch((err) => {
-          console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
-        });
-      }
-    };
-    // Play immediately, on loadedmetadata, and after a delay as fallback
-    doPlay();
-    remoteAudio.addEventListener("loadedmetadata", doPlay, { once: true });
-    setTimeout(doPlay, 500);
-    // When remote track starts receiving media, retry play
-    audioTracks.forEach((track) => {
-      track.addEventListener("unmute", () => {
-        console.debug("[iSay] remote track unmuted:", peerId, track.readyState);
-        doPlay();
-      }, { once: true });
-    });
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
     }
 
-    // --- WebAudio: visualization / analysis only ---
-    // IMPORTANT: Chrome's createMediaStreamSource() takes exclusive ownership of
-    // the MediaStream, silencing any HTMLAudioElement using the same stream.
-    // We MUST clone the stream so the original stream plays through HTMLAudioElement.
+    // --- Visualization analyser (use cloned stream to avoid interfering with playback) ---
     let analyser = null;
     if (audioCtx) {
       try {
@@ -492,17 +440,9 @@
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.8;
         src.connect(analyser);
-        // Safari/iOS: HTMLAudioElement is unreliable for WebRTC streams;
-        // use WebAudio destination as the primary playback path.
-        if (isSafari) {
-          src.connect(audioCtx.destination);
-          console.debug("[iSay] WebAudio destination connected (Safari):", peerId, "ctxState:", audioCtx.state);
-        }
       } catch (e) {
-        console.warn("[iSay] WebAudio routing failed:", e);
+        console.warn("[iSay] WebAudio analyser failed:", e);
       }
-    } else {
-      console.warn("[iSay] no audioCtx for peer:", peerId);
     }
 
     peers.set(peerId, { call, remoteAudio, analyser });
