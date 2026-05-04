@@ -430,6 +430,7 @@
       return;
     }
 
+    // --- Remote audio playback via HTMLAudioElement ---
     const remoteAudio = new Audio();
     remoteAudio.srcObject = stream;
     remoteAudio.autoplay = true;
@@ -437,50 +438,58 @@
     remoteAudio.setAttribute("playsinline", "");
     remoteAudio.muted = false;
     remoteAudio.volume = speakerOn ? 0.85 : 1.0;
-    // Safari requires audio element to be in the DOM tree to play
-    if (isSafari) {
-      remoteAudio.style.position = "absolute";
-      remoteAudio.style.opacity = "0";
-      remoteAudio.style.pointerEvents = "none";
-      remoteAudio.style.width = "1px";
-      remoteAudio.style.height = "1px";
-      document.body.appendChild(remoteAudio);
-    }
+    // Always add audio element to DOM — some browsers (including certain Chrome
+    // versions) need this for reliable WebRTC MediaStream playback.
+    remoteAudio.style.position = "absolute";
+    remoteAudio.style.opacity = "0";
+    remoteAudio.style.pointerEvents = "none";
+    remoteAudio.style.width = "1px";
+    remoteAudio.style.height = "1px";
+    document.body.appendChild(remoteAudio);
 
     // Diagnostic: log stream track info
     const audioTracks = stream.getAudioTracks();
     console.debug("[iSay] addPeer stream tracks:", peerId, "audioTracks:", audioTracks.length, "readyStates:", audioTracks.map((t) => t.readyState), "muted:", audioTracks.map((t) => t.muted), "enabled:", audioTracks.map((t) => t.enabled));
 
     const doPlay = () => {
-      remoteAudio.play().then(() => {
-        console.debug("[iSay] remoteAudio playing:", peerId);
-      }).catch((err) => {
-        console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
-      });
+      if (remoteAudio.paused) {
+        remoteAudio.play().then(() => {
+          console.debug("[iSay] remoteAudio playing:", peerId);
+        }).catch((err) => {
+          console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
+        });
+      }
     };
-    if (remoteAudio.readyState >= 1) {
-      doPlay();
-    } else {
-      remoteAudio.addEventListener("loadedmetadata", doPlay, { once: true });
-      setTimeout(doPlay, 300);
-    }
+    // Play immediately, on loadedmetadata, and after a delay as fallback
+    doPlay();
+    remoteAudio.addEventListener("loadedmetadata", doPlay, { once: true });
+    setTimeout(doPlay, 500);
+    // When remote track starts receiving media, retry play
+    audioTracks.forEach((track) => {
+      track.addEventListener("unmute", () => {
+        console.debug("[iSay] remote track unmuted:", peerId, track.readyState);
+        doPlay();
+      }, { once: true });
+    });
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
     }
 
+    // --- WebAudio: visualization / analysis only ---
+    // IMPORTANT: Chrome's createMediaStreamSource() takes exclusive ownership of
+    // the MediaStream, silencing any HTMLAudioElement using the same stream.
+    // We MUST clone the stream so the original stream plays through HTMLAudioElement.
     let analyser = null;
     if (audioCtx) {
       try {
-        const src = audioCtx.createMediaStreamSource(stream);
+        const vizStream = stream.clone();
+        const src = audioCtx.createMediaStreamSource(vizStream);
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.8;
         src.connect(analyser);
         // Safari/iOS: HTMLAudioElement is unreliable for WebRTC streams;
-        // use WebAudio destination as the playback path instead.
-        // Chrome/Firefox: createMediaStreamSource "consumes" the stream,
-        // so connecting to destination conflicts with HTMLAudioElement and
-        // causes silence. Only use analyser (for visualization) on those browsers.
+        // use WebAudio destination as the primary playback path.
         if (isSafari) {
           src.connect(audioCtx.destination);
           console.debug("[iSay] WebAudio destination connected (Safari):", peerId, "ctxState:", audioCtx.state);
@@ -520,7 +529,7 @@
     if (info.remoteAudio) {
       info.remoteAudio.pause();
       info.remoteAudio.srcObject = null;
-      if (isSafari && info.remoteAudio.parentNode) {
+      if (info.remoteAudio.parentNode) {
         info.remoteAudio.parentNode.removeChild(info.remoteAudio);
       }
     }
@@ -537,7 +546,7 @@
       if (info.remoteAudio) {
         info.remoteAudio.pause();
         info.remoteAudio.srcObject = null;
-        if (isSafari && info.remoteAudio.parentNode) {
+        if (info.remoteAudio.parentNode) {
           info.remoteAudio.parentNode.removeChild(info.remoteAudio);
         }
       }
