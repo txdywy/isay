@@ -164,6 +164,40 @@
     screens[name].classList.add("active");
   }
 
+  // --- iOS/Safari autoplay unlock ---
+  let audioUnlocked = false;
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    // Play a silent Audio element to unlock autoplay for HTMLAudioElement
+    const silent = new Audio();
+    silent.play().catch(() => {});
+    // Also unlock Web Audio API context
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.01);
+      ctx.close().catch(() => {});
+    } catch (_) {}
+  }
+
+  // Global tap-to-resume: Safari may block autoplay until user interacts.
+  // Any click/touch on the page retries playing all remote audios.
+  function tryResumeAllAudio() {
+    for (const [, info] of peers) {
+      if (info.remoteAudio && info.remoteAudio.paused) {
+        info.remoteAudio.play().catch(() => {});
+      }
+    }
+  }
+  document.addEventListener("click", tryResumeAllAudio);
+  document.addEventListener("touchstart", tryResumeAllAudio);
+
   // --- Media ---
   async function getLocalStream() {
     if (localStream) return localStream;
@@ -408,7 +442,14 @@
       remoteAudio.style.height = "1px";
       document.body.appendChild(remoteAudio);
     }
-    remoteAudio.play().catch(() => {});
+    const tryPlay = () => {
+      remoteAudio.play().then(() => {
+        console.debug("[iSay] remoteAudio playing:", peerId);
+      }).catch((err) => {
+        console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
+      });
+    };
+    tryPlay();
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
     }
@@ -1477,6 +1518,9 @@
     if (typeof token !== "string") token = $("#token-input").value;
     token = token.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
     if (!token) { $("#token-input").focus(); return; }
+
+    // Unlock autoplay as early as possible (must be inside user-gesture handler)
+    unlockAudio();
 
     setPhase("signaling");
     showScreen("waiting");
