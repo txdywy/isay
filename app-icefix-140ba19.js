@@ -442,14 +442,21 @@
       remoteAudio.style.height = "1px";
       document.body.appendChild(remoteAudio);
     }
-    const tryPlay = () => {
+    const doPlay = () => {
       remoteAudio.play().then(() => {
         console.debug("[iSay] remoteAudio playing:", peerId);
       }).catch((err) => {
         console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
       });
     };
-    tryPlay();
+    // Safari needs loadedmetadata before play() will succeed reliably
+    if (remoteAudio.readyState >= 1) {
+      doPlay();
+    } else {
+      remoteAudio.addEventListener("loadedmetadata", doPlay, { once: true });
+      // Fallback: if loadedmetadata never fires, try anyway after a short delay
+      setTimeout(doPlay, 300);
+    }
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
     }
