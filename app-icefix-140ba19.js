@@ -31,7 +31,7 @@
 
   const MAX_RECONNECT_ATTEMPTS = 3;
   const RECONNECT_BACKOFF = [2000, 4000, 8000];
-  const CALL_STREAM_TIMEOUT = 12000;
+  const CALL_STREAM_TIMEOUT = 18000;
   const HOST_RETRY_DELAYS = [0, 2500, 6500];
   const MESH_CONNECT_DELAY = 900;
   const MESH_SCAN_INTERVAL = 8000;
@@ -127,6 +127,12 @@
   const ICE_CONFIG = {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: "stun:stun.ekiga.net:3478" },
+      { urls: "stun:stun.ideasip.com:3478" },
       {
         urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
         username: "peerjs",
@@ -136,7 +142,7 @@
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 1,
+    iceCandidatePoolSize: 4,
   };
 
   // --- DOM ---
@@ -209,25 +215,34 @@
   }
 
   function applySDPOptimization(call) {
-    const pc = call.peerConnection;
-    if (!pc) return;
-    const origCreateOffer = pc.createOffer.bind(pc);
-    pc.createOffer = async function (...args) {
-      const offer = await origCreateOffer(...args);
-      offer.sdp = optimizeSDP(offer.sdp);
-      return offer;
+    const tryPatch = () => {
+      const pc = call.peerConnection;
+      if (!pc) {
+        // PeerJS may create peerConnection asynchronously; retry next frame
+        requestAnimationFrame(tryPatch);
+        return;
+      }
+      if (pc._isayPatched) return;
+      pc._isayPatched = true;
+      const origCreateOffer = pc.createOffer.bind(pc);
+      pc.createOffer = async function (...args) {
+        const offer = await origCreateOffer(...args);
+        offer.sdp = optimizeSDP(offer.sdp);
+        return offer;
+      };
+      const origCreateAnswer = pc.createAnswer.bind(pc);
+      pc.createAnswer = async function (...args) {
+        const answer = await origCreateAnswer(...args);
+        answer.sdp = optimizeSDP(answer.sdp);
+        return answer;
+      };
+      const origSetRemote = pc.setRemoteDescription.bind(pc);
+      pc.setRemoteDescription = async function (desc) {
+        if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
+        return origSetRemote(desc);
+      };
     };
-    const origCreateAnswer = pc.createAnswer.bind(pc);
-    pc.createAnswer = async function (...args) {
-      const answer = await origCreateAnswer(...args);
-      answer.sdp = optimizeSDP(answer.sdp);
-      return answer;
-    };
-    const origSetRemote = pc.setRemoteDescription.bind(pc);
-    pc.setRemoteDescription = async function (desc) {
-      if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
-      return origSetRemote(desc);
-    };
+    tryPatch();
   }
 
   // --- Adaptive bitrate ---
@@ -466,9 +481,40 @@
     if (!pc) return;
     setupNetworkMigration();
 
+    let disconnectedTimer = null;
+    let connectingTimer = null;
+
     pc.onconnectionstatechange = () => {
-      console.debug("[iSay] peer connectionState:", pc.connectionState);
-      if (pc.connectionState === "failed") scheduleReconnect();
+      const state = pc.connectionState;
+      console.debug("[iSay] peer connectionState:", state);
+      if (state === "failed") {
+        if (disconnectedTimer) { clearTimeout(disconnectedTimer); disconnectedTimer = null; }
+        if (connectingTimer) { clearTimeout(connectingTimer); connectingTimer = null; }
+        scheduleReconnect();
+      } else if (state === "disconnected") {
+        if (!disconnectedTimer) {
+          disconnectedTimer = setTimeout(() => {
+            disconnectedTimer = null;
+            if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+              console.warn("[iSay] peer disconnected for 5s, triggering ICE restart");
+              attemptICERestart(pc);
+            }
+          }, 5000);
+        }
+      } else if (state === "connected") {
+        if (disconnectedTimer) { clearTimeout(disconnectedTimer); disconnectedTimer = null; }
+        if (connectingTimer) { clearTimeout(connectingTimer); connectingTimer = null; }
+      } else if (state === "connecting") {
+        if (!connectingTimer) {
+          connectingTimer = setTimeout(() => {
+            connectingTimer = null;
+            if (pc.connectionState === "connecting" || pc.connectionState === "disconnected") {
+              console.warn("[iSay] peer stuck in connecting for 15s, triggering ICE restart");
+              attemptICERestart(pc);
+            }
+          }, 15000);
+        }
+      }
     };
 
     pc.oniceconnectionstatechange = () => {
@@ -921,7 +967,13 @@
     const qos = getQoSState(target);
     if (now - qos.lastIceRestart < 10000) return;
     qos.lastIceRestart = now;
-    try { target.restartIce(); } catch (_) {}
+    try {
+      target.restartIce();
+      // Let browser fire onnegotiationneeded; PeerJS internal Negotiator
+      // listens to that event and will re-offer automatically.
+    } catch (e) {
+      console.warn("[iSay] restartIce failed:", e);
+    }
   }
 
   function scheduleReconnect() {
@@ -930,6 +982,31 @@
       endCall("Connection lost. Max reconnection attempts reached.");
       return;
     }
+
+    // In mesh: if some peers are still healthy, only reconnect the broken ones
+    if (peers.size > 1) {
+      const deadPeerIds = [];
+      for (const [pid, info] of peers) {
+        const pc = info.call?.peerConnection;
+        if (!pc || pc.connectionState === "failed" || pc.iceConnectionState === "failed") {
+          deadPeerIds.push(pid);
+        }
+      }
+      if (deadPeerIds.length > 0) {
+        for (const pid of deadPeerIds) {
+          removePeer(pid);
+          if (currentPeerId && currentToken) {
+            const targetId = pid; // peerId is the full PeerJS id
+            setTimeout(() => {
+              if (peer && peer.open) initiateCall(targetId, { maxAttempts: 2, retryDelays: [1000, 3000] });
+            }, 500);
+          }
+        }
+        // If all peers died, fall through to global reconnect instead of returning
+        if (peers.size > 0) return;
+      }
+    }
+
     const delay = RECONNECT_BACKOFF[Math.min(reconnectAttempts, RECONNECT_BACKOFF.length - 1)];
     setConnType("disconnected");
     updateMetrics(-1, -1, -1);
@@ -966,25 +1043,77 @@
     }
     applySDPOptimization(call);
     monitorSinglePeerConnection(call.peerConnection);
+
+    // Guard against zombie calls: if stream never arrives after answer, close it
+    let streamTimer = null;
+    const clearStreamTimer = () => {
+      if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+    };
+
     call.on("stream", (remoteStream) => {
+      clearStreamTimer();
       addPeer(call.peer, call, remoteStream);
     });
-    call.on("close", () => removePeer(call.peer, false));
+    call.on("close", () => { clearStreamTimer(); removePeer(call.peer, false); });
     call.on("error", (err) => {
+      clearStreamTimer();
       console.warn("[iSay] incoming call error:", call.peer, err);
       removePeer(call.peer);
     });
-    try {
-      call.answer(localStream);
-    } catch (err) {
-      console.warn("[iSay] answer failed:", call.peer, err);
-      try { call.close(); } catch (_) {}
+    // Fallback: if PeerJS stream event is missed (known Safari/PeerJS bug),
+    // manually recover from RTCRtpReceivers once ICE is up.
+    const pcIn = call.peerConnection;
+    if (pcIn) {
+      const recoverStream = () => {
+        if (peers.has(call.peer)) return;
+        if ((pcIn.connectionState === "connected" || pcIn.connectionState === "connecting") && pcIn.getReceivers) {
+          const receivers = pcIn.getReceivers().filter((r) => r.track && r.track.kind === "audio" && r.track.readyState !== "ended");
+          if (receivers.length > 0) {
+            console.warn("[iSay] incoming call stream event missed, recovering from receivers:", call.peer);
+            addPeer(call.peer, call, new MediaStream(receivers.map((r) => r.track)));
+          }
+        }
+      };
+      setTimeout(recoverStream, 6000);
+      setTimeout(recoverStream, 12000);
     }
+    const doAnswer = () => {
+      if (!localStream) {
+        setTimeout(doAnswer, 100);
+        return;
+      }
+      try {
+        call.answer(localStream);
+        // If no stream within 18s after answer, kill this call so caller can retry
+        streamTimer = setTimeout(() => {
+          if (!peers.has(call.peer)) {
+            console.warn("[iSay] incoming call stream timeout:", call.peer);
+            try { call.close(); } catch (_) {}
+          }
+        }, CALL_STREAM_TIMEOUT);
+      } catch (err) {
+        console.warn("[iSay] answer failed:", call.peer, err);
+        try { call.close(); } catch (_) {}
+      }
+    };
+    doAnswer();
   }
 
-  function initiateCall(targetPeerId, options = {}) {
+  async function initiateCall(targetPeerId, options = {}) {
     if (!peer || !peer.open || targetPeerId === peer.id) return;
     if (peers.has(targetPeerId) || pendingCalls.has(targetPeerId)) return;
+    // Cap concurrent dialing attempts to avoid signaling channel saturation
+    if (pendingCalls.size >= 4) return;
+    // Safari/iOS may stop tracks when backgrounded; re-acquire if needed
+    if (!localStream || localStream.getAudioTracks().length === 0 || localStream.getAudioTracks().every((t) => !t.enabled || t.readyState === "ended")) {
+      try {
+        localStream = null;
+        await getLocalStream();
+      } catch (e) {
+        console.warn("[iSay] failed to re-acquire local stream:", e);
+        return;
+      }
+    }
 
     const attempt = options.attempt || 1;
     const maxAttempts = options.maxAttempts || 1;
@@ -995,8 +1124,11 @@
     }
 
     console.debug("[iSay] dialing peer:", targetPeerId, "attempt:", attempt);
-    applySDPOptimization(call);
-    monitorSinglePeerConnection(call.peerConnection);
+    // Defer patch slightly so PeerJS finishes internal peerConnection setup
+    setTimeout(() => {
+      applySDPOptimization(call);
+      monitorSinglePeerConnection(call.peerConnection);
+    }, 0);
 
     const timer = setTimeout(() => {
       if (peers.has(targetPeerId)) return;
@@ -1030,6 +1162,23 @@
         startMeshScan(currentToken);
       }
     });
+    // Fallback: if PeerJS stream event is missed (known Safari/PeerJS bug),
+    // manually recover from RTCRtpReceivers once ICE is up.
+    const pcOut = call.peerConnection;
+    if (pcOut) {
+      const recoverStream = () => {
+        if (peers.has(targetPeerId)) return;
+        if ((pcOut.connectionState === "connected" || pcOut.connectionState === "connecting") && pcOut.getReceivers) {
+          const receivers = pcOut.getReceivers().filter((r) => r.track && r.track.kind === "audio" && r.track.readyState !== "ended");
+          if (receivers.length > 0) {
+            console.warn("[iSay] outgoing call stream event missed, recovering from receivers:", targetPeerId);
+            addPeer(targetPeerId, call, new MediaStream(receivers.map((r) => r.track)));
+          }
+        }
+      };
+      setTimeout(recoverStream, 6000);
+      setTimeout(recoverStream, 12000);
+    }
   }
 
   function retryCall(targetPeerId, options) {
@@ -1041,8 +1190,12 @@
     setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
   }
 
+  let lastMeshScanTime = 0;
   function startMeshScan(token) {
     if (!peer || !peer.open || peers.size > 0) return;
+    const now = Date.now();
+    if (now - lastMeshScanTime < 4000) return; // throttle to avoid storm
+    lastMeshScanTime = now;
     setPhase("ice");
     showToast("Still waiting for the other side. Retrying...", 2500);
     scanRoomPeers(token);
@@ -1072,16 +1225,27 @@
       console.warn("[iSay] PeerJS signaling disconnected");
       if (peer !== p || p.destroyed) return;
       setPhase("signaling");
-      setTimeout(() => {
-        if (peer === p && !p.destroyed && p.disconnected) {
-          try { p.reconnect(); } catch (_) {}
+      let reconTries = 0;
+      const doReconnect = () => {
+        if (peer !== p || p.destroyed || !p.disconnected) return;
+        reconTries++;
+        try { p.reconnect(); } catch (_) {}
+        if (reconTries < 3) {
+          setTimeout(doReconnect, 1000 * reconTries);
+        } else if (peers.size === 0 && currentToken) {
+          scheduleReconnect();
         }
-      }, 500);
+      };
+      setTimeout(doReconnect, 500);
     });
 
     p.on("close", () => {
       console.warn("[iSay] PeerJS connection closed");
       if (peer === p) clearAllPendingCalls();
+    });
+
+    p.on("error", (err) => {
+      console.error("[iSay] PeerJS error:", err.type, err.message);
     });
   }
 
@@ -1105,8 +1269,17 @@
     // Try to claim host slot
     const hostId = `isay-${token}-host`;
     return new Promise((resolve, reject) => {
+      let aborted = false;
+      const abort = () => { aborted = true; };
+      // Store abort hook so UI cancel can stop the connection attempt
+      connectPeer._abort = abort;
+
       const timeout = setTimeout(() => {
-        if (!currentRole) { p.destroy(); reject(new Error("Connection timed out. Make sure the other person has the link open.")); }
+        if (aborted) return;
+        if (!currentRole) {
+          try { p.destroy(); } catch (_) {}
+          reject(new Error("Connection timed out. Make sure the other person has the link open."));
+        }
       }, 12000);
 
       const p = new Peer(hostId, { debug: 0, config: ICE_CONFIG });
@@ -1126,11 +1299,17 @@
       });
 
       p.on("error", (err) => {
+        if (aborted) { try { p.destroy(); } catch (_) {} return; }
         if (err.type === "unavailable-id" && !currentRole) {
           // Host taken - become guest
           p.destroy();
           let guestIdx = 0;
           const tryGuest = () => {
+            if (aborted) {
+              clearTimeout(timeout);
+              reject(new Error("Cancelled."));
+              return;
+            }
             if (guestIdx >= MAX_PEERS) {
               clearTimeout(timeout);
               reject(new Error("Room is full."));
@@ -1165,6 +1344,10 @@
             });
 
             gp.on("error", (guestErr) => {
+              if (aborted) {
+                try { gp.destroy(); } catch (_) {}
+                return;
+              }
               if (guestErr.type === "unavailable-id") {
                 gp.destroy();
                 guestIdx++;
@@ -1278,6 +1461,7 @@
     stopLocalStream();
     destroyPeer();
     currentPeerId = null;
+    lastMeshScanTime = 0;
     // Reset audio session
     if ("audioSession" in navigator) {
       try { navigator.audioSession.type = "auto"; } catch (_) {}
@@ -1350,7 +1534,10 @@
   $("#btn-join").addEventListener("click", () => joinRoom());
   $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
   $("#btn-copy-link").addEventListener("click", copyShareLink);
-  $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing"); });
+  $("#btn-cancel-wait").addEventListener("click", () => {
+    if (typeof connectPeer === "function" && connectPeer._abort) connectPeer._abort();
+    destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing");
+  });
   $("#btn-mute").addEventListener("click", toggleMute);
   const speakerBtn = $("#btn-speaker");
   if (speakerBtn) speakerBtn.addEventListener("click", toggleSpeaker);
