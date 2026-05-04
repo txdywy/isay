@@ -24,6 +24,8 @@
   let meshScanTimer = null;
   let hostScanTimer = null;
 
+  // --- Chat & Data ---
+  const dataConns = new Map(); // peerId -> DataConnection
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
   const pendingCalls = new Map(); // peerId -> { call, timer, attempts }
@@ -327,8 +329,7 @@
     if (iconOn) iconOn.style.display = speakerOn ? "" : "none";
     if (iconOff) iconOff.style.display = speakerOn ? "none" : "";
     if (label) label.textContent = speakerOn ? "Speaker" : "Earpiece";
-    haptic(speakerOn ? [20, 10, 20] : 30);
-
+    
     // iOS: use audioSession API
     configureAudioSession();
 
@@ -361,6 +362,55 @@
       }
     } else {
       showToast(speakerOn ? "Speaker mode" : "Earpiece mode", 1500);
+    }
+  }
+
+  // ========== Data Connections ==========
+  function setupDataConnection(conn) {
+    conn.on("open", () => {
+      dataConns.set(conn.peer, conn);
+    });
+    conn.on("data", (data) => {
+      try {
+        const payload = JSON.parse(data);
+        if (payload.type === "chat") {
+          appendChatMessage(payload.text, "remote", conn.peer.slice(-4));
+        } else if (payload.type === "ping") {
+          appendChatMessage("Received Ping", "ping");
+          // Send pong back
+          conn.send(JSON.stringify({ type: "pong", id: payload.id }));
+        } else if (payload.type === "pong") {
+          appendChatMessage("Received Pong!", "pong");
+          const pingEl = document.getElementById(`ping-${payload.id}`);
+          if (pingEl) {
+            pingEl.textContent = "Ping Success!";
+            pingEl.classList.remove("msg-sys");
+            pingEl.classList.add("msg-pong");
+          }
+        }
+      } catch (e) {
+        if (typeof data === "string") appendChatMessage(data, "remote");
+      }
+    });
+    conn.on("close", () => dataConns.delete(conn.peer));
+    conn.on("error", () => dataConns.delete(conn.peer));
+  }
+
+  function appendChatMessage(text, type = "sys", label = "") {
+    const container = $("#chat-messages");
+    if (!container) return;
+    const el = document.createElement("div");
+    el.className = `msg msg-${type}`;
+    el.textContent = label ? `${label}: ${text}` : text;
+    container.appendChild(el);
+    container.scrollTop = container.scrollHeight;
+    return el;
+  }
+
+  function broadcastData(payload) {
+    const dataStr = JSON.stringify(payload);
+    for (const [id, conn] of dataConns) {
+      if (conn.open) conn.send(dataStr);
     }
   }
 
@@ -1149,6 +1199,13 @@
     if (peers.has(targetPeerId) || pendingCalls.has(targetPeerId)) return;
     // Cap concurrent dialing attempts to avoid signaling channel saturation
     if (pendingCalls.size >= 4) return;
+
+    // Connect data channel alongside media call
+    if (!dataConns.has(targetPeerId)) {
+      const conn = peer.connect(targetPeerId, { reliable: true });
+      setupDataConnection(conn);
+    }
+
     // Safari/iOS may stop tracks when backgrounded; re-acquire if needed
     if (!localStream || localStream.getAudioTracks().length === 0 || localStream.getAudioTracks().every((t) => !t.enabled || t.readyState === "ended")) {
       try {
@@ -1294,6 +1351,10 @@
 
     p.on("error", (err) => {
       console.error("[iSay] PeerJS error:", err.type, err.message);
+    });
+
+    p.on("connection", (conn) => {
+      setupDataConnection(conn);
     });
   }
 
@@ -1616,7 +1677,49 @@
   $("#btn-restart").addEventListener("click", restart);
   $("#btn-retry").addEventListener("click", () => { if (currentToken) joinRoom(currentToken); else restart(); });
 
+  // Chat & Ping Events
+  const btnChatSend = $("#btn-chat-send");
+  const chatInput = $("#chat-input");
+  const btnPing = $("#btn-ping");
+
+  const sendChat = () => {
+    const text = chatInput.value.trim();
+    if (!text) return;
+    appendChatMessage(text, "local", "You");
+    broadcastData({ type: "chat", text });
+    chatInput.value = "";
+  };
+
+  btnChatSend?.addEventListener("click", sendChat);
+  chatInput?.addEventListener("keypress", (e) => {
+    if (e.key === "Enter") sendChat();
+  });
+
+  btnPing?.addEventListener("click", () => {
+    if (dataConns.size === 0) {
+      appendChatMessage("No peers connected for Ping", "sys");
+      return;
+    }
+    const pingId = Date.now().toString();
+    const el = appendChatMessage("Sending Ping...", "ping");
+    el.id = `ping-${pingId}`;
+    
+    broadcastData({ type: "ping", id: pingId });
+    
+    // Timeout for ping
+    setTimeout(() => {
+      if (el.textContent === "Sending Ping...") {
+        el.textContent = "Ping Timeout";
+        el.classList.remove("msg-ping");
+        el.classList.add("msg-sys");
+        el.style.color = "var(--danger)";
+      }
+    }, 5000);
+  });
+
   document.addEventListener("keydown", (e) => {
+    // Ignore if typing in input
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
     if (e.code === "Space" && peers.size > 0 && !e.repeat) { e.preventDefault(); toggleMute(); }
   });
 

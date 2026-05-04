@@ -153,6 +153,15 @@
             <span>Hang Up</span>
           </button>
         </div>
+
+        <div class="chat-container">
+          <div class="chat-messages" id="chat-messages"></div>
+          <div class="chat-input-row">
+            <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off" />
+            <button id="btn-chat-send" class="btn-chat" title="Send message">Send</button>
+            <button id="btn-ping" class="btn-chat btn-ping" title="Send Ping">Ping</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -175,7 +184,7 @@
   </div>
 
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="app.js?v=20260504e"></script>
+  <script src="app.js?v=20260504f"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("./sw.js").then((reg) => { reg.update(); });
