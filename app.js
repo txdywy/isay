@@ -22,6 +22,7 @@
   let speakerOn = true;
   let networkMigrationInitialized = false;
   let meshScanTimer = null;
+  let hostScanTimer = null;
 
   // Mesh: track all active peer connections
   const peers = new Map(); // peerId -> { call, remoteAudio, analyser }
@@ -31,7 +32,7 @@
 
   const MAX_RECONNECT_ATTEMPTS = 3;
   const RECONNECT_BACKOFF = [2000, 4000, 8000];
-  const CALL_STREAM_TIMEOUT = 12000;
+  const CALL_STREAM_TIMEOUT = 18000;
   const HOST_RETRY_DELAYS = [0, 2500, 6500];
   const MESH_CONNECT_DELAY = 900;
   const MESH_SCAN_INTERVAL = 8000;
@@ -104,6 +105,10 @@
     return issues;
   }
 
+  // --- Safari detection ---
+  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
   // --- Audio constraints (optimized for low latency voice) ---
   const AUDIO_CONSTRAINTS = {
     audio: {
@@ -127,6 +132,12 @@
   const ICE_CONFIG = {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: "stun:stun.ekiga.net:3478" },
+      { urls: "stun:stun.ideasip.com:3478" },
       {
         urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
         username: "peerjs",
@@ -136,7 +147,7 @@
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 1,
+    iceCandidatePoolSize: 4,
   };
 
   // --- DOM ---
@@ -152,6 +163,43 @@
     Object.values(screens).forEach((s) => s.classList.remove("active"));
     screens[name].classList.add("active");
   }
+
+  // --- iOS/Safari autoplay unlock ---
+  let audioUnlocked = false;
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    // Play a silent Audio element to unlock autoplay for HTMLAudioElement
+    const silent = new Audio();
+    silent.play().catch(() => {});
+    // Also unlock Web Audio API context
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.01);
+      ctx.close().catch(() => {});
+    } catch (_) {}
+  }
+
+  // Global tap-to-resume: iOS may block both AudioContext and HTMLAudioElement
+  // until user interacts. Any click/touch on the page wakes everything up.
+  function tryResumeAllAudio() {
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+    for (const [, info] of peers) {
+      if (info.remoteAudio && info.remoteAudio.paused) {
+        info.remoteAudio.play().catch(() => {});
+      }
+    }
+  }
+  document.addEventListener("click", tryResumeAllAudio);
+  document.addEventListener("touchstart", tryResumeAllAudio);
 
   // --- Media ---
   async function getLocalStream() {
@@ -174,17 +222,19 @@
   }
 
   // --- SDP optimization (low latency, high quality voice) ---
+  // Safari is strict about opus fmtp params: keep it conservative there.
   function optimizeSDP(sdp) {
     const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
     if (!opusMatch) return sdp;
     const opusPT = opusMatch[1];
-    // useinbandfec=1: packet loss resilience via FEC
-    // maxaveragebitrate=48000: fullband quality (~48kbps average)
-    // usedtx=1: silence suppression (DTX) to save bandwidth
-    // cbr=0: variable bitrate for best quality at target bitrate
-    // stereo=0; sprop-stereo=0: mono for lower latency and bandwidth
-    // maxplaybackrate=48000; sprop-maxcapturerate=48000: fullband 48kHz
-    const fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
+    let fmtpLine;
+    if (isSafari) {
+      // Safari/iOS: minimal safe opus params
+      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;maxplaybackrate=48000`;
+    } else {
+      // Chrome/Firefox/Edge: full low-latency tuning
+      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
+    }
     const lines = sdp.split("\r\n");
     let replaced = false;
     let lastOpusIdx = -1;
@@ -200,34 +250,45 @@
     if (!replaced && lastOpusIdx >= 0) {
       lines.splice(lastOpusIdx + 1, 0, fmtpLine);
     }
-    // Add ptime/maxptime for consistent packetization (20ms optimal for voice)
-    const hasPtime = lines.some(l => l === "a=ptime:20");
-    const hasMaxptime = lines.some(l => l === "a=maxptime:60");
-    if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
-    if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
+    // ptime/maxptime: Safari ignores or rejects these; skip on Safari
+    if (!isSafari) {
+      const hasPtime = lines.some((l) => l === "a=ptime:20");
+      const hasMaxptime = lines.some((l) => l === "a=maxptime:60");
+      if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
+      if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
+    }
     return lines.join("\r\n");
   }
 
   function applySDPOptimization(call) {
-    const pc = call.peerConnection;
-    if (!pc) return;
-    const origCreateOffer = pc.createOffer.bind(pc);
-    pc.createOffer = async function (...args) {
-      const offer = await origCreateOffer(...args);
-      offer.sdp = optimizeSDP(offer.sdp);
-      return offer;
+    const tryPatch = () => {
+      const pc = call.peerConnection;
+      if (!pc) {
+        // PeerJS may create peerConnection asynchronously; retry next frame
+        requestAnimationFrame(tryPatch);
+        return;
+      }
+      if (pc._isayPatched) return;
+      pc._isayPatched = true;
+      const origCreateOffer = pc.createOffer.bind(pc);
+      pc.createOffer = async function (...args) {
+        const offer = await origCreateOffer(...args);
+        offer.sdp = optimizeSDP(offer.sdp);
+        return offer;
+      };
+      const origCreateAnswer = pc.createAnswer.bind(pc);
+      pc.createAnswer = async function (...args) {
+        const answer = await origCreateAnswer(...args);
+        answer.sdp = optimizeSDP(answer.sdp);
+        return answer;
+      };
+      const origSetRemote = pc.setRemoteDescription.bind(pc);
+      pc.setRemoteDescription = async function (desc) {
+        if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
+        return origSetRemote(desc);
+      };
     };
-    const origCreateAnswer = pc.createAnswer.bind(pc);
-    pc.createAnswer = async function (...args) {
-      const answer = await origCreateAnswer(...args);
-      answer.sdp = optimizeSDP(answer.sdp);
-      return answer;
-    };
-    const origSetRemote = pc.setRemoteDescription.bind(pc);
-    pc.setRemoteDescription = async function (desc) {
-      if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
-      return origSetRemote(desc);
-    };
+    tryPatch();
   }
 
   // --- Adaptive bitrate ---
@@ -374,8 +435,35 @@
     remoteAudio.autoplay = true;
     remoteAudio.playsInline = true;
     remoteAudio.setAttribute("playsinline", "");
-    remoteAudio.volume = speakerOn ? 0.85 : 1.0; // Reduce echo in speakerphone mode
-    remoteAudio.play().catch(() => {});
+    remoteAudio.muted = false;
+    remoteAudio.volume = speakerOn ? 0.85 : 1.0;
+    // Safari requires audio element to be in the DOM tree to play
+    if (isSafari) {
+      remoteAudio.style.position = "absolute";
+      remoteAudio.style.opacity = "0";
+      remoteAudio.style.pointerEvents = "none";
+      remoteAudio.style.width = "1px";
+      remoteAudio.style.height = "1px";
+      document.body.appendChild(remoteAudio);
+    }
+
+    // Diagnostic: log stream track info
+    const audioTracks = stream.getAudioTracks();
+    console.debug("[iSay] addPeer stream tracks:", peerId, "audioTracks:", audioTracks.length, "readyStates:", audioTracks.map((t) => t.readyState), "muted:", audioTracks.map((t) => t.muted), "enabled:", audioTracks.map((t) => t.enabled));
+
+    const doPlay = () => {
+      remoteAudio.play().then(() => {
+        console.debug("[iSay] remoteAudio playing:", peerId);
+      }).catch((err) => {
+        console.warn("[iSay] remoteAudio play blocked:", peerId, err.name);
+      });
+    };
+    if (remoteAudio.readyState >= 1) {
+      doPlay();
+    } else {
+      remoteAudio.addEventListener("loadedmetadata", doPlay, { once: true });
+      setTimeout(doPlay, 300);
+    }
     if (currentAudioOutput !== "default" && remoteAudio.setSinkId) {
       remoteAudio.setSinkId(currentAudioOutput).catch(() => {});
     }
@@ -388,7 +476,20 @@
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.8;
         src.connect(analyser);
-      } catch (_) {}
+        // Safari/iOS: HTMLAudioElement is unreliable for WebRTC streams;
+        // use WebAudio destination as the playback path instead.
+        // Chrome/Firefox: createMediaStreamSource "consumes" the stream,
+        // so connecting to destination conflicts with HTMLAudioElement and
+        // causes silence. Only use analyser (for visualization) on those browsers.
+        if (isSafari) {
+          src.connect(audioCtx.destination);
+          console.debug("[iSay] WebAudio destination connected (Safari):", peerId, "ctxState:", audioCtx.state);
+        }
+      } catch (e) {
+        console.warn("[iSay] WebAudio routing failed:", e);
+      }
+    } else {
+      console.warn("[iSay] no audioCtx for peer:", peerId);
     }
 
     peers.set(peerId, { call, remoteAudio, analyser });
@@ -419,6 +520,9 @@
     if (info.remoteAudio) {
       info.remoteAudio.pause();
       info.remoteAudio.srcObject = null;
+      if (isSafari && info.remoteAudio.parentNode) {
+        info.remoteAudio.parentNode.removeChild(info.remoteAudio);
+      }
     }
     updatePeerCount();
     if (peers.size === 0 && currentToken) {
@@ -433,6 +537,9 @@
       if (info.remoteAudio) {
         info.remoteAudio.pause();
         info.remoteAudio.srcObject = null;
+        if (isSafari && info.remoteAudio.parentNode) {
+          info.remoteAudio.parentNode.removeChild(info.remoteAudio);
+        }
       }
     }
     peers.clear();
@@ -461,14 +568,73 @@
     }
   }
 
+  function clearHostScanTimer() {
+    if (hostScanTimer) {
+      clearInterval(hostScanTimer);
+      hostScanTimer = null;
+    }
+  }
+
+  function startHostScan(token) {
+    if (!peer || !peer.open || currentRole !== "host") return;
+    if (hostScanTimer) return;
+    const doScan = () => {
+      if (!peer || !peer.open || currentRole !== "host" || peers.size > 0) {
+        clearHostScanTimer();
+        return;
+      }
+      for (let i = 0; i < MAX_PEERS; i++) {
+        const guestId = `isay-${token}-g${i}`;
+        if (!peers.has(guestId) && !pendingCalls.has(guestId)) {
+          initiateCall(guestId, { maxAttempts: 1 });
+        }
+      }
+    };
+    // Delay first scan so guest has time to open its page
+    setTimeout(doScan, 800);
+    hostScanTimer = setInterval(doScan, MESH_SCAN_INTERVAL);
+  }
+
   // ========== Connection monitoring (per-peer) ==========
   function monitorSinglePeerConnection(pc) {
-    if (!pc) return;
+    if (!pc || pc._isayMonitored) return;
+    pc._isayMonitored = true;
     setupNetworkMigration();
 
+    let disconnectedTimer = null;
+    let connectingTimer = null;
+
     pc.onconnectionstatechange = () => {
-      console.debug("[iSay] peer connectionState:", pc.connectionState);
-      if (pc.connectionState === "failed") scheduleReconnect();
+      const state = pc.connectionState;
+      console.debug("[iSay] peer connectionState:", state);
+      if (state === "failed") {
+        if (disconnectedTimer) { clearTimeout(disconnectedTimer); disconnectedTimer = null; }
+        if (connectingTimer) { clearTimeout(connectingTimer); connectingTimer = null; }
+        scheduleReconnect();
+      } else if (state === "disconnected") {
+        if (!disconnectedTimer) {
+          disconnectedTimer = setTimeout(() => {
+            disconnectedTimer = null;
+            if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+              console.warn("[iSay] peer disconnected for 5s, triggering ICE restart");
+              attemptICERestart(pc);
+            }
+          }, 5000);
+        }
+      } else if (state === "connected") {
+        if (disconnectedTimer) { clearTimeout(disconnectedTimer); disconnectedTimer = null; }
+        if (connectingTimer) { clearTimeout(connectingTimer); connectingTimer = null; }
+      } else if (state === "connecting") {
+        if (!connectingTimer) {
+          connectingTimer = setTimeout(() => {
+            connectingTimer = null;
+            if (pc.connectionState === "connecting" || pc.connectionState === "disconnected") {
+              console.warn("[iSay] peer stuck in connecting for 15s, triggering ICE restart");
+              attemptICERestart(pc);
+            }
+          }, 15000);
+        }
+      }
     };
 
     pc.oniceconnectionstatechange = () => {
@@ -583,9 +749,11 @@
 
   // ========== Audio Visualizer ==========
   function initAudioViz() {
-    try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-    } catch (_) { return; }
+    if (!audioCtx) {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+      } catch (_) { return; }
+    }
     if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
 
     const localSrc = audioCtx.createMediaStreamSource(localStream);
@@ -921,7 +1089,13 @@
     const qos = getQoSState(target);
     if (now - qos.lastIceRestart < 10000) return;
     qos.lastIceRestart = now;
-    try { target.restartIce(); } catch (_) {}
+    try {
+      target.restartIce();
+      // Let browser fire onnegotiationneeded; PeerJS internal Negotiator
+      // listens to that event and will re-offer automatically.
+    } catch (e) {
+      console.warn("[iSay] restartIce failed:", e);
+    }
   }
 
   function scheduleReconnect() {
@@ -930,6 +1104,31 @@
       endCall("Connection lost. Max reconnection attempts reached.");
       return;
     }
+
+    // In mesh: if some peers are still healthy, only reconnect the broken ones
+    if (peers.size > 1) {
+      const deadPeerIds = [];
+      for (const [pid, info] of peers) {
+        const pc = info.call?.peerConnection;
+        if (!pc || pc.connectionState === "failed" || pc.iceConnectionState === "failed") {
+          deadPeerIds.push(pid);
+        }
+      }
+      if (deadPeerIds.length > 0) {
+        for (const pid of deadPeerIds) {
+          removePeer(pid);
+          if (currentPeerId && currentToken) {
+            const targetId = pid; // peerId is the full PeerJS id
+            setTimeout(() => {
+              if (peer && peer.open) initiateCall(targetId, { maxAttempts: 2, retryDelays: [1000, 3000] });
+            }, 500);
+          }
+        }
+        // If all peers died, fall through to global reconnect instead of returning
+        if (peers.size > 0) return;
+      }
+    }
+
     const delay = RECONNECT_BACKOFF[Math.min(reconnectAttempts, RECONNECT_BACKOFF.length - 1)];
     setConnType("disconnected");
     updateMetrics(-1, -1, -1);
@@ -966,25 +1165,80 @@
     }
     applySDPOptimization(call);
     monitorSinglePeerConnection(call.peerConnection);
+
+    // Guard against zombie calls: if stream never arrives after answer, close it
+    let streamTimer = null;
+    const clearStreamTimer = () => {
+      if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+    };
+
     call.on("stream", (remoteStream) => {
+      clearStreamTimer();
       addPeer(call.peer, call, remoteStream);
     });
-    call.on("close", () => removePeer(call.peer, false));
+    call.on("close", () => { clearStreamTimer(); removePeer(call.peer, false); });
     call.on("error", (err) => {
+      clearStreamTimer();
       console.warn("[iSay] incoming call error:", call.peer, err);
       removePeer(call.peer);
     });
-    try {
-      call.answer(localStream);
-    } catch (err) {
-      console.warn("[iSay] answer failed:", call.peer, err);
-      try { call.close(); } catch (_) {}
+    // Fallback: if PeerJS stream event is missed (known Safari/PeerJS bug),
+    // manually recover from RTCRtpReceivers once ICE is up.
+    const pcIn = call.peerConnection;
+    if (pcIn) {
+      const recoverStream = () => {
+        if (peers.has(call.peer)) return;
+        if ((pcIn.connectionState === "connected" || pcIn.connectionState === "connecting") && pcIn.getReceivers) {
+          const receivers = pcIn.getReceivers().filter((r) => r.track && r.track.kind === "audio" && r.track.readyState !== "ended");
+          if (receivers.length > 0) {
+            console.warn("[iSay] incoming call stream event missed, recovering from receivers:", call.peer);
+            addPeer(call.peer, call, new MediaStream(receivers.map((r) => r.track)));
+          }
+        }
+      };
+      setTimeout(recoverStream, 6000);
+      setTimeout(recoverStream, 12000);
     }
+    const doAnswer = () => {
+      if (!localStream) {
+        setTimeout(doAnswer, 100);
+        return;
+      }
+      // Diagnostic
+      const tracks = localStream.getAudioTracks();
+      console.debug("[iSay] answering with localStream:", call.peer, "tracks:", tracks.length, "readyState:", tracks.map((t) => t.readyState), "enabled:", tracks.map((t) => t.enabled));
+      try {
+        call.answer(localStream);
+        // If no stream within 18s after answer, kill this call so caller can retry
+        streamTimer = setTimeout(() => {
+          if (!peers.has(call.peer)) {
+            console.warn("[iSay] incoming call stream timeout:", call.peer);
+            try { call.close(); } catch (_) {}
+          }
+        }, CALL_STREAM_TIMEOUT);
+      } catch (err) {
+        console.warn("[iSay] answer failed:", call.peer, err);
+        try { call.close(); } catch (_) {}
+      }
+    };
+    doAnswer();
   }
 
-  function initiateCall(targetPeerId, options = {}) {
+  async function initiateCall(targetPeerId, options = {}) {
     if (!peer || !peer.open || targetPeerId === peer.id) return;
     if (peers.has(targetPeerId) || pendingCalls.has(targetPeerId)) return;
+    // Cap concurrent dialing attempts to avoid signaling channel saturation
+    if (pendingCalls.size >= 4) return;
+    // Safari/iOS may stop tracks when backgrounded; re-acquire if needed
+    if (!localStream || localStream.getAudioTracks().length === 0 || localStream.getAudioTracks().every((t) => !t.enabled || t.readyState === "ended")) {
+      try {
+        localStream = null;
+        await getLocalStream();
+      } catch (e) {
+        console.warn("[iSay] failed to re-acquire local stream:", e);
+        return;
+      }
+    }
 
     const attempt = options.attempt || 1;
     const maxAttempts = options.maxAttempts || 1;
@@ -994,9 +1248,15 @@
       return;
     }
 
-    console.debug("[iSay] dialing peer:", targetPeerId, "attempt:", attempt);
-    applySDPOptimization(call);
-    monitorSinglePeerConnection(call.peerConnection);
+    const localTracks = localStream.getAudioTracks();
+    console.debug("[iSay] dialing peer:", targetPeerId, "attempt:", attempt, "localTracks:", localTracks.length, "readyState:", localTracks.map((t) => t.readyState), "enabled:", localTracks.map((t) => t.enabled));
+    // PeerJS creates peerConnection asynchronously; retry patch/monitor at multiple intervals
+    [0, 50, 150, 400].forEach((ms) => {
+      setTimeout(() => {
+        applySDPOptimization(call);
+        monitorSinglePeerConnection(call.peerConnection);
+      }, ms);
+    });
 
     const timer = setTimeout(() => {
       if (peers.has(targetPeerId)) return;
@@ -1030,6 +1290,23 @@
         startMeshScan(currentToken);
       }
     });
+    // Fallback: if PeerJS stream event is missed (known Safari/PeerJS bug),
+    // manually recover from RTCRtpReceivers once ICE is up.
+    const pcOut = call.peerConnection;
+    if (pcOut) {
+      const recoverStream = () => {
+        if (peers.has(targetPeerId)) return;
+        if ((pcOut.connectionState === "connected" || pcOut.connectionState === "connecting") && pcOut.getReceivers) {
+          const receivers = pcOut.getReceivers().filter((r) => r.track && r.track.kind === "audio" && r.track.readyState !== "ended");
+          if (receivers.length > 0) {
+            console.warn("[iSay] outgoing call stream event missed, recovering from receivers:", targetPeerId);
+            addPeer(targetPeerId, call, new MediaStream(receivers.map((r) => r.track)));
+          }
+        }
+      };
+      setTimeout(recoverStream, 6000);
+      setTimeout(recoverStream, 12000);
+    }
   }
 
   function retryCall(targetPeerId, options) {
@@ -1041,8 +1318,12 @@
     setTimeout(() => initiateCall(targetPeerId, { ...options, attempt: attempt + 1 }), retryDelay);
   }
 
+  let lastMeshScanTime = 0;
   function startMeshScan(token) {
     if (!peer || !peer.open || peers.size > 0) return;
+    const now = Date.now();
+    if (now - lastMeshScanTime < 4000) return; // throttle to avoid storm
+    lastMeshScanTime = now;
     setPhase("ice");
     showToast("Still waiting for the other side. Retrying...", 2500);
     scanRoomPeers(token);
@@ -1072,16 +1353,27 @@
       console.warn("[iSay] PeerJS signaling disconnected");
       if (peer !== p || p.destroyed) return;
       setPhase("signaling");
-      setTimeout(() => {
-        if (peer === p && !p.destroyed && p.disconnected) {
-          try { p.reconnect(); } catch (_) {}
+      let reconTries = 0;
+      const doReconnect = () => {
+        if (peer !== p || p.destroyed || !p.disconnected) return;
+        reconTries++;
+        try { p.reconnect(); } catch (_) {}
+        if (reconTries < 3) {
+          setTimeout(doReconnect, 1000 * reconTries);
+        } else if (peers.size === 0 && currentToken) {
+          scheduleReconnect();
         }
-      }, 500);
+      };
+      setTimeout(doReconnect, 500);
     });
 
     p.on("close", () => {
       console.warn("[iSay] PeerJS connection closed");
       if (peer === p) clearAllPendingCalls();
+    });
+
+    p.on("error", (err) => {
+      console.error("[iSay] PeerJS error:", err.type, err.message);
     });
   }
 
@@ -1105,8 +1397,17 @@
     // Try to claim host slot
     const hostId = `isay-${token}-host`;
     return new Promise((resolve, reject) => {
+      let aborted = false;
+      const abort = () => { aborted = true; };
+      // Store abort hook so UI cancel can stop the connection attempt
+      connectPeer._abort = abort;
+
       const timeout = setTimeout(() => {
-        if (!currentRole) { p.destroy(); reject(new Error("Connection timed out. Make sure the other person has the link open.")); }
+        if (aborted) return;
+        if (!currentRole) {
+          try { p.destroy(); } catch (_) {}
+          reject(new Error("Connection timed out. Make sure the other person has the link open."));
+        }
       }, 12000);
 
       const p = new Peer(hostId, { debug: 0, config: ICE_CONFIG });
@@ -1122,15 +1423,23 @@
         // Listen for all incoming calls (mesh)
         p.on("call", (call) => handleIncomingCall(call));
         initAudioViz();
+        // Host also scans guest slots (bidirectional discovery)
+        startHostScan(token);
         resolve({ role: "host" });
       });
 
       p.on("error", (err) => {
+        if (aborted) { try { p.destroy(); } catch (_) {} return; }
         if (err.type === "unavailable-id" && !currentRole) {
           // Host taken - become guest
           p.destroy();
           let guestIdx = 0;
           const tryGuest = () => {
+            if (aborted) {
+              clearTimeout(timeout);
+              reject(new Error("Cancelled."));
+              return;
+            }
             if (guestIdx >= MAX_PEERS) {
               clearTimeout(timeout);
               reject(new Error("Room is full."));
@@ -1152,8 +1461,13 @@
               // Initiate audio viz for local stream
               initAudioViz();
 
-              // Connect to host first. Other occupied guest slots are secondary mesh links.
-              initiateCall(hostId, { maxAttempts: HOST_RETRY_DELAYS.length, retryDelays: HOST_RETRY_DELAYS, required: true });
+              // Connect to host first. Small delay lets PeerJS server sync host state.
+              setTimeout(() => {
+                if (peer && peer.open) {
+                  initiateCall(hostId, { maxAttempts: HOST_RETRY_DELAYS.length, retryDelays: HOST_RETRY_DELAYS, required: true });
+                }
+              }, 400);
+              // Also proactively scan backwards in case our call to host was dropped by signaling server
               for (let i = 0; i < guestIdx; i++) {
                 const id = `isay-${token}-g${i}`;
                 setTimeout(() => {
@@ -1165,6 +1479,10 @@
             });
 
             gp.on("error", (guestErr) => {
+              if (aborted) {
+                try { gp.destroy(); } catch (_) {}
+                return;
+              }
               if (guestErr.type === "unavailable-id") {
                 gp.destroy();
                 guestIdx++;
@@ -1234,6 +1552,20 @@
     token = token.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
     if (!token) { $("#token-input").focus(); return; }
 
+    // Unlock autoplay as early as possible (must be inside user-gesture handler)
+    unlockAudio();
+
+    // iOS requires AudioContext.resume() inside a user gesture.
+    // Create / resume it here so addPeer can safely connect streams to destination.
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+    } catch (_) {}
+
     setPhase("signaling");
     showScreen("waiting");
     showShareLink(token);
@@ -1269,6 +1601,7 @@
   function endCall(reason) {
     clearReconnectTimer();
     clearMeshScanTimer();
+    clearHostScanTimer();
     stopDurationTimer();
     stopAudioViz();
     stopStatsMonitor();
@@ -1278,6 +1611,7 @@
     stopLocalStream();
     destroyPeer();
     currentPeerId = null;
+    lastMeshScanTime = 0;
     // Reset audio session
     if ("audioSession" in navigator) {
       try { navigator.audioSession.type = "auto"; } catch (_) {}
@@ -1309,6 +1643,7 @@
     stopStatsMonitor();
     clearReconnectTimer();
     clearMeshScanTimer();
+    clearHostScanTimer();
     releaseWakeLock();
     reconnectAttempts = 0;
     currentToken = null;
@@ -1350,7 +1685,10 @@
   $("#btn-join").addEventListener("click", () => joinRoom());
   $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
   $("#btn-copy-link").addEventListener("click", copyShareLink);
-  $("#btn-cancel-wait").addEventListener("click", () => { destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing"); });
+  $("#btn-cancel-wait").addEventListener("click", () => {
+    if (typeof connectPeer === "function" && connectPeer._abort) connectPeer._abort();
+    destroyPeer(); stopLocalStream(); closeAllPeers(); showScreen("landing");
+  });
   $("#btn-mute").addEventListener("click", toggleMute);
   const speakerBtn = $("#btn-speaker");
   if (speakerBtn) speakerBtn.addEventListener("click", toggleSpeaker);
