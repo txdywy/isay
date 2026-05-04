@@ -251,7 +251,11 @@
     return lines.join("\r\n");
   }
 
+  // Disabled: original working version had no SDP patching.
+  // The monkey-patching of createOffer/createAnswer/setRemoteDescription
+  // may interfere with ICE negotiation on some networks.
   function applySDPOptimization(call) {
+    return; // no-op
     const tryPatch = () => {
       const pc = call.peerConnection;
       if (!pc) {
