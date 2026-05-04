@@ -136,7 +136,6 @@
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:global.stun.twilio.com:3478" },
     ],
     iceTransportPolicy: "all",
   };
@@ -212,79 +211,10 @@
     }
   }
 
-  // --- SDP optimization (low latency, high quality voice) ---
-  // Safari is strict about opus fmtp params: keep it conservative there.
-  function optimizeSDP(sdp) {
-    const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
-    if (!opusMatch) return sdp;
-    const opusPT = opusMatch[1];
-    let fmtpLine;
-    if (isSafari) {
-      // Safari/iOS: minimal safe opus params
-      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;maxplaybackrate=48000`;
-    } else {
-      // Chrome/Firefox/Edge: full low-latency tuning
-      fmtpLine = `a=fmtp:${opusPT} useinbandfec=1;maxaveragebitrate=48000;stereo=0;sprop-stereo=0;usedtx=1;cbr=0;maxplaybackrate=48000;sprop-maxcapturerate=48000`;
-    }
-    const lines = sdp.split("\r\n");
-    let replaced = false;
-    let lastOpusIdx = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].startsWith(`a=rtpmap:${opusPT}`) || lines[i].startsWith(`a=fmtp:${opusPT}`)) {
-        lastOpusIdx = i;
-      }
-      if (lines[i].startsWith(`a=fmtp:${opusPT}`)) {
-        lines[i] = fmtpLine;
-        replaced = true;
-      }
-    }
-    if (!replaced && lastOpusIdx >= 0) {
-      lines.splice(lastOpusIdx + 1, 0, fmtpLine);
-    }
-    // ptime/maxptime: Safari ignores or rejects these; skip on Safari
-    if (!isSafari) {
-      const hasPtime = lines.some((l) => l === "a=ptime:20");
-      const hasMaxptime = lines.some((l) => l === "a=maxptime:60");
-      if (!hasPtime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=ptime:20");
-      if (!hasMaxptime && lastOpusIdx >= 0) lines.splice(lastOpusIdx + 1, 0, "a=maxptime:60");
-    }
-    return lines.join("\r\n");
-  }
-
-  // Disabled: original working version had no SDP patching.
-  // The monkey-patching of createOffer/createAnswer/setRemoteDescription
-  // may interfere with ICE negotiation on some networks.
-  function applySDPOptimization(call) {
-    return; // no-op
-    const tryPatch = () => {
-      const pc = call.peerConnection;
-      if (!pc) {
-        // PeerJS may create peerConnection asynchronously; retry next frame
-        requestAnimationFrame(tryPatch);
-        return;
-      }
-      if (pc._isayPatched) return;
-      pc._isayPatched = true;
-      const origCreateOffer = pc.createOffer.bind(pc);
-      pc.createOffer = async function (...args) {
-        const offer = await origCreateOffer(...args);
-        offer.sdp = optimizeSDP(offer.sdp);
-        return offer;
-      };
-      const origCreateAnswer = pc.createAnswer.bind(pc);
-      pc.createAnswer = async function (...args) {
-        const answer = await origCreateAnswer(...args);
-        answer.sdp = optimizeSDP(answer.sdp);
-        return answer;
-      };
-      const origSetRemote = pc.setRemoteDescription.bind(pc);
-      pc.setRemoteDescription = async function (desc) {
-        if (desc && desc.sdp) desc.sdp = optimizeSDP(desc.sdp);
-        return origSetRemote(desc);
-      };
-    };
-    tryPatch();
-  }
+  // SDP optimization disabled — monkey-patching createOffer/createAnswer/
+  // setRemoteDescription was breaking ICE negotiation.
+  // Audio quality is tuned via RTP sender.setParameters() in adaptAudioBitrate() instead.
+  function applySDPOptimization(_call) { /* no-op */ }
 
   // --- Adaptive bitrate ---
   async function adaptAudioBitrate(pc, loss, jitter, rtt) {
