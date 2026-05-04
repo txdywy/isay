@@ -128,26 +128,30 @@
     video: false,
   };
 
-  // --- ICE config (optimized for 5G + WiFi + restrictive NAT) ---
+  // --- ICE config ---
+  // Cloudflare STUN is globally reachable (including China).
+  // Metered OpenRelay provides free TURN (20GB/month).
+  // Multiple TURN transports (UDP + TCP + TLS on 443) for restrictive NATs/firewalls.
   const ICE_CONFIG = {
     iceServers: [
+      { urls: "stun:stun.cloudflare.com:3478" },
       { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" },
-      { urls: "stun:stun3.l.google.com:19302" },
-      { urls: "stun:stun4.l.google.com:19302" },
-      { urls: "stun:stun.ekiga.net:3478" },
-      { urls: "stun:stun.ideasip.com:3478" },
       {
-        urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
-        username: "peerjs",
-        credential: "peerjsp",
+        urls: [
+          "turn:standard.relay.metered.ca:80",
+          "turn:standard.relay.metered.ca:80?transport=tcp",
+          "turn:standard.relay.metered.ca:443",
+          "turn:standard.relay.metered.ca:443?transport=tcp",
+          "turns:standard.relay.metered.ca:443?transport=tcp",
+        ],
+        username: "openrelayproject",
+        credential: "openrelayproject",
       },
     ],
     iceTransportPolicy: "all",
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
-    iceCandidatePoolSize: 4,
+    iceCandidatePoolSize: 2,
   };
 
   // --- DOM ---
