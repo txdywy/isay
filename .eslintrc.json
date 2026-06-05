@@ -1,0 +1,58 @@
+{
+  "env": {
+    "browser": true,
+    "es2022": true,
+    "node": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "module"
+  },
+  "globals": {
+    "QRCode": "readonly",
+    "Peer": "readonly"
+  },
+  "rules": {
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "no-console": ["warn", { "allow": ["debug", "info", "warn", "error"] }],
+    "prefer-const": "error",
+    "no-var": "error",
+    "eqeqeq": ["error", "always"],
+    "curly": ["error", "multi-line"],
+    "no-throw-literal": "error",
+    "no-template-curly-in-string": "error",
+    "no-promise-executor-return": "error",
+    "no-self-compare": "error",
+    "no-unreachable-loop": "error",
+    "no-use-before-define": ["error", { "functions": false, "classes": false }],
+    "arrow-body-style": ["warn", "as-needed"],
+    "no-confusing-arrow": "error",
+    "no-useless-computed-key": "error",
+    "no-useless-rename": "error",
+    "object-shorthand": ["warn", "always"],
+    "prefer-arrow-callback": "warn",
+    "prefer-template": "warn",
+    "symbol-description": "error",
+    "no-loss-of-precision": "error",
+    "no-unsafe-optional-chaining": "error"
+  },
+  "overrides": [
+    {
+      "files": ["tests/**/*.js"],
+      "env": {
+        "mocha": true
+      },
+      "globals": {
+        "vi": "readonly",
+        "describe": "readonly",
+        "it": "readonly",
+        "expect": "readonly",
+        "beforeEach": "readonly",
+        "afterEach": "readonly"
+      },
+      "rules": {
+        "no-console": "off"
+      }
+    }
+  ]
+}

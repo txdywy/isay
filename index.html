@@ -7,10 +7,13 @@
   <meta name="color-scheme" content="dark">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="iSay - Peer-to-peer voice chat. No registration required, just share the link.">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <title>iSay - P2P Voice Chat</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="apple-touch-icon" href="favicon.svg">
+  <link rel="manifest" href="manifest.json">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -184,7 +187,7 @@
   </div>
 
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="app.js?v=20260504f"></script>
+  <script type="module" src="js/main.js"></script>
   <script>
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("./sw.js").then((reg) => { reg.update(); });
